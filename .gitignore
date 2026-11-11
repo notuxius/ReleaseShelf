@@ -1,0 +1,10 @@
+/recipes/
+/targets.json
+/build/
+/dist/
+/design/
+*.exe
+__pycache__/
+*.py[cod]
+.venv/
+.env
