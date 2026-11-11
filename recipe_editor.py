@@ -7,24 +7,30 @@ import tempfile
 import tkinter as tk
 from tkinter import ttk
 
-from fetch_sources import Recipe, WINDOWS_ISO_RESOLVER
+from companion_buttons import add_companion_buttons
+from fetch_sources import Recipe, WINDOWS_ISO_PAGE, WINDOWS_ISO_RESOLVER
 from fetch_store import fetch_lock
 from releaseshelf import ERRORS
 from shelf_icons import make_icon
+from shelf_checklist import catalog_item, read_catalog_item
 from shelf_i18n import tr
 from shelf_message import error_detail, message
 from shelf_paint import stage_window
 from shelf_progress import DownloadProgress
 from shelf_scroll import grid_scrollable
-from shelf_theme import WINDOW_SIDE_PADDING, initial_geometry, style_titlebar
+from shelf_text import FittedLabel
+from shelf_theme import WINDOW_SIDE_PADDING, category_picker, initial_geometry, style_titlebar
 
 
 PAGE_FIELDS = ("page", "version_pattern", "download", "download_resolver", "sha256_pattern")
 GITHUB_FIELDS = ("github", "asset_pattern")
+SOURCE_FIELDS = {"Publisher page": PAGE_FIELDS, "GitHub release": GITHUB_FIELDS,
+                 "Direct download": ("direct_download",), "Local file or folder": ("local_path",)}
 OPTIONAL_FIELDS = ("filename", "sha256", "product_version", "publish_exe", "extract_folder", "shortcut")
 FIELD_LABELS = {
     "id": "Item ID", "name": "Name", "category": "Category",
     "page": "Publisher page URL", "version_pattern": "Version pattern", "download": "Download URL",
+    "direct_download": "Download URL", "local_path": "Local path",
     "github": "Repository", "asset_pattern": "Asset pattern", "filename": "Archive filename",
     "sha256": "Archive SHA-256", "sha256_pattern": "SHA-256 pattern (optional)",
     "product_version": "Check EXE version", "publish_exe": "Publish EXE",
@@ -44,18 +50,22 @@ def text_field(parent, *, row, column=0, pady=0, style="TFrame", **options):
     return text
 
 
+def recipe_bytes(data):
+    return (json.dumps(data, ensure_ascii=False, indent=2) + "\n").replace("\n", os.linesep).encode("utf-8")
+
+
 def save_recipe(catalog, data, path, original):
     previous = None
     if original is not None:
         try:
-            previous = Recipe.from_data(json.loads(original.decode("utf-8-sig")))
+            previous = catalog_item(json.loads(original.decode("utf-8-sig")))
         except ERRORS:
             pass  # An invalid recipe can be repaired in the raw editor.
-    renaming = previous is not None and isinstance(data, dict) and data.get("id") != previous.id
+    renaming = isinstance(previous, Recipe) and isinstance(data, dict) and data.get("id") != previous.id
     if renaming:
         history = [old_id for old_id in (*previous.previous_ids, previous.id) if old_id != data.get("id")]
         data = {**data, "previous_ids": history}
-    recipe = Recipe.from_data(data)
+    recipe = catalog_item(data)
     adding = path is None
     if adding:
         path = catalog / f"{recipe.id}.json"
@@ -70,15 +80,16 @@ def save_recipe(catalog, data, path, original):
             if other == path:
                 continue
             try:
-                other_recipe = Recipe.read(other)
+                other_recipe = read_catalog_item(other)
             except OSError:
                 raise
             except ERRORS:
                 continue  # An unrelated invalid recipe can be repaired separately.
-            if recipe.shortcut and recipe.shortcut.casefold() == other_recipe.shortcut.casefold():
+            if (isinstance(recipe, Recipe) and recipe.shortcut and isinstance(other_recipe, Recipe)
+                    and recipe.shortcut.casefold() == other_recipe.shortcut.casefold()):
                 raise ValueError(f"Start menu shortcut {recipe.shortcut!r} is already used by {other.name}.")
             owners.update(dict.fromkeys(other_recipe.id_keys(), other.name))
-        if renaming:
+        if renaming and isinstance(recipe, Recipe):
             # A previously shared ID belongs to the remaining app when repairing a duplicate.
             data["previous_ids"] = [value for value in recipe.previous_ids if value.casefold() not in owners]
         for app_id in (recipe.id, *data.get("previous_ids", [])):
@@ -88,7 +99,7 @@ def save_recipe(catalog, data, path, original):
         with tempfile.NamedTemporaryFile(dir=catalog, suffix=".tmp", delete=False) as handle:
             temp = Path(handle.name)
         try:
-            temp.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            temp.write_bytes(recipe_bytes(data))
             if adding and os.name == "nt":
                 temp.rename(path)  # Windows rename refuses to overwrite a new file.
             elif adding:
@@ -101,7 +112,7 @@ def save_recipe(catalog, data, path, original):
 
 
 class RecipeEditor(tk.Toplevel):
-    def __init__(self, parent, catalog, path, palette, on_saved, *, on_action=None):
+    def __init__(self, parent, catalog, path, palette, on_saved, *, on_action=None, categories=()):
         self.original = path.read_bytes() if path is not None else None
         self.data = {}
         raw = None
@@ -109,7 +120,7 @@ class RecipeEditor(tk.Toplevel):
             content = self.original.decode("utf-8-sig")
             try:
                 self.data = json.loads(content)
-                Recipe.from_data(self.data)
+                catalog_item(self.data, path=path)
             except ERRORS:
                 raw = content
         super().__init__(parent)
@@ -152,16 +163,29 @@ class RecipeEditor(tk.Toplevel):
             self.field(catalog_tab, 2, "name")
             ttk.Label(catalog_tab, text=tr("Leave blank to show the item ID."),
                       style="Muted.TLabel").grid(row=3, column=1, sticky="w", pady=(0, 10))
-            self.field(catalog_tab, 4, "category")
+            self.field(catalog_tab, 4, "category", choices=categories)
+            self.apply_settings = tk.BooleanVar(self, self.data.get("apply_custom_settings", False))
+            if path is not None and "local_path" not in self.data:
+                item = Recipe.from_data(self.data, path=path)
+                if item.apply_custom_settings or item.has_portable_settings():
+                    self.settings_button = ttk.Checkbutton(catalog_tab, text=tr("Apply custom settings"),
+                                                           variable=self.apply_settings)
+                    self.settings_button.grid(row=5, column=1, sticky="w", pady=(8, 0))
+                    ttk.Label(catalog_tab, text=tr("Use the saved config on Save and Get updates."),
+                              style="Muted.TLabel").grid(row=6, column=1, sticky="w")
+                add_companion_buttons(catalog_tab, self.data, lambda: item.companion_dir,
+                                      lambda error: self.error.set(error), 7, open_instructions=False)
             source = ttk.Frame(tabs, padding=TAB_PADDING)
             source.columnconfigure(1, weight=1)
             self.add_tab(source, "Source", "language")
             ttk.Label(source, text=tr("Source type")).grid(row=0, column=0, sticky="w", padx=(0, 12))
             switch = ttk.Frame(source)
             switch.grid(row=0, column=1, sticky="w", pady=(2, 9))
-            self.source = tk.StringVar(self, "GitHub release" if "github" in self.data else "Publisher page")
+            current_source = next((source for source, fields in SOURCE_FIELDS.items() if fields[0] in self.data),
+                                  "Publisher page")
+            self.source = tk.StringVar(self, current_source)
             self.source_frames = {}
-            for name in ("Publisher page", "GitHub release"):
+            for name in SOURCE_FIELDS:
                 ttk.Radiobutton(switch, text=tr(name), value=name, variable=self.source, style="Theme.Toolbutton",
                                 command=self.show_source).pack(side="left")
                 group = ttk.Frame(source)
@@ -180,12 +204,18 @@ class RecipeEditor(tk.Toplevel):
                 page, text=tr("Request a Windows 11 English x64 ISO link from Microsoft"),
                 variable=resolver, onvalue=WINDOWS_ISO_RESOLVER, offvalue="", command=self.show_download)
             self.windows_iso_button.grid(row=5, column=1, sticky="w")
+            self.fields["page"].trace_add("write", self.show_download)
             self.show_download()
             ttk.Label(page, text=tr("Use {version} in the download URL or archive filename."),
                       style="Muted.TLabel").grid(row=6, column=1, sticky="w", pady=(5, 0))
             github = self.source_frames["GitHub release"]
             self.field(github, 0, "github")
             self.field(github, 1, "asset_pattern")
+            direct = self.source_frames["Direct download"]
+            self.field(direct, 0, "direct_download")
+            ttk.Label(direct, text=tr("Track the publisher's download modification time."),
+                      style="Muted.TLabel").grid(row=1, column=1, sticky="w")
+            self.field(self.source_frames["Local file or folder"], 0, "local_path")
             ttk.Label(github, text=tr("Example: owner/repository and *-windows-x64.zip"), style="Muted.TLabel"
                       ).grid(row=2, column=1, sticky="w")
             self.show_source()
@@ -244,7 +274,7 @@ class RecipeEditor(tk.Toplevel):
         panel.grid(row=0, column=0, sticky="nsew", pady=(0, 12))
         panel.columnconfigure(0, weight=1)
         panel.rowconfigure(1, weight=1)
-        self.detail_title = ttk.Label(panel, width=1, style="Detail.TLabel")
+        self.detail_title = FittedLabel(panel, style="Detail.TLabel")
         self.detail_title.grid(row=0, column=0, sticky="ew", padx=12, pady=(0, 6))
         self.detail = text_field(panel, row=1, style="Surface.TFrame", width=42, height=6,
                                  state="disabled", wrap="word", font=("Segoe UI", 10), padx=12,
@@ -261,7 +291,7 @@ class RecipeEditor(tk.Toplevel):
             self.buttons[action] = button
 
     def set_app_info(self, title, detail):
-        self.detail_title.configure(text=title)
+        self.detail_title.set_text(title)
         self.detail.configure(state="normal")
         self.detail.delete("1.0", "end")
         self.detail.insert("1.0", detail)
@@ -271,8 +301,9 @@ class RecipeEditor(tk.Toplevel):
         self.busy = busy
         self.save_button.configure(state="disabled" if busy else "normal")
         enabled = not busy and not self.raw_editor and self.on_action is not None
-        for button in self.buttons.values():
-            button.configure(state="normal" if enabled else "disabled")
+        for action, button in self.buttons.items():
+            allowed = enabled and (action == "verify" or not self.data.get("updates_disabled"))
+            button.configure(state="normal" if allowed else "disabled")
 
     def run_action(self, action):
         if self.busy or self.raw_editor or self.on_action is None:
@@ -295,11 +326,14 @@ class RecipeEditor(tk.Toplevel):
         self.error.set("")
         self.on_action(action)
 
-    def field(self, group, row, key):
+    def field(self, group, row, key, *, choices=None):
         ttk.Label(group, text=tr(FIELD_LABELS[key])).grid(row=row, column=0, sticky="w", padx=(0, 12))
         value = tk.StringVar(self, value=self.data.get(key, ""))
         self.fields[key] = value
-        entry = ttk.Entry(group, textvariable=value, width=49)
+        if choices is None:
+            entry = ttk.Entry(group, textvariable=value, width=49)
+        else:
+            entry = category_picker(group, value, choices, width=49)
         entry.grid(row=row, column=1, sticky="ew", pady=5)
         return entry
 
@@ -310,8 +344,14 @@ class RecipeEditor(tk.Toplevel):
             else:
                 group.grid_remove()
 
-    def show_download(self):
-        self.download_entry.state(["disabled" if self.fields["download_resolver"].get() else "!disabled"])
+    def show_download(self, *_):
+        resolver = self.fields["download_resolver"]
+        if self.fields["page"].get() == WINDOWS_ISO_PAGE:
+            self.windows_iso_button.grid()
+        else:
+            self.windows_iso_button.grid_remove()
+            resolver.set("")
+        self.download_entry.state(["disabled" if resolver.get() else "!disabled"])
 
     def apply_titlebar(self):
         style_titlebar(self, self.palette.is_dark)
@@ -348,17 +388,23 @@ class RecipeEditor(tk.Toplevel):
         if self.raw_editor:
             return json.loads(self.text_area.get("1.0", "end-1c"))
         data = self.data.copy()
+        if self.apply_settings.get() or "apply_custom_settings" in data:
+            data["apply_custom_settings"] = self.apply_settings.get()
         for key in ("name", "category"):
             value = self.fields[key].get().strip()
             if value:
                 data[key] = value
             else:
                 data.pop(key, None)
-        page = self.source.get() == "Publisher page"
-        for key in GITHUB_FIELDS if page else PAGE_FIELDS:
-            data.pop(key, None)
-        required = GITHUB_FIELDS
-        if page:
+        source = self.source.get()
+        if source == "Local file or folder":
+            data.pop("updates_disabled", None)
+        for other, fields in SOURCE_FIELDS.items():
+            if other != source:
+                for key in fields:
+                    data.pop(key, None)
+        required = SOURCE_FIELDS[source]
+        if source == "Publisher page":
             required = ("page", "version_pattern")
             resolver = self.fields["download_resolver"].get()
             if resolver:
@@ -376,6 +422,8 @@ class RecipeEditor(tk.Toplevel):
             if not value:
                 raise ValueError(message("Enter a value for {key}.", key=message(FIELD_LABELS[key])))
             data[key] = value
+        if source == "Local file or folder":
+            return {key: data[key] for key in ("id", "name", "category", "local_path") if key in data}
         for key in OPTIONAL_FIELDS:
             value = self.fields[key].get()
             if value:

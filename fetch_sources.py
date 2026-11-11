@@ -13,6 +13,8 @@ import tempfile
 import zipfile
 from contextlib import closing
 from dataclasses import dataclass
+from datetime import timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from time import monotonic
 from urllib.parse import quote, unquote, urlsplit
@@ -25,6 +27,9 @@ from shelf_windows_iso import open_windows_iso
 
 
 WINDOWS_ISO_RESOLVER = "windows-11-english-x64"
+WINDOWS_ISO_PAGE = "https://www.microsoft.com/en-us/software-download/windows11"
+CONFIG_SUFFIXES = {".ini", ".cfg", ".conf", ".config", ".toml"}
+NAMED_CONFIG_SUFFIXES = CONFIG_SUFFIXES | {".xml", ".json", ".yaml", ".yml", ".properties", ".prefs"}
 
 
 def filename(value):
@@ -33,6 +38,25 @@ def filename(value):
             or value.endswith((".", " "))):
         raise ValueError(message("Invalid filename: {value!r}", value=value))
     return value
+
+
+def companion_actions(data):
+    def relative(value, extensions):
+        if not isinstance(value, str):
+            raise ValueError("Companion actions need relative filenames.")
+        path = Path(*(filename(part) for part in value.replace("\\", "/").split("/")))
+        if path.suffix.lower() not in extensions:
+            raise ValueError(f"Unsupported companion action file: {value}")
+        return path
+
+    script = relative(data["restore_script"], {".ps1"}) if "restore_script" in data else None
+    admin = data.get("restore_as_admin", False)
+    manuals = data.get("manual_files", [])
+    if not isinstance(admin, bool) or (admin and not script):
+        raise ValueError("restore_as_admin requires a restore script and a boolean value.")
+    if not isinstance(manuals, list):
+        raise ValueError("manual_files must be a list of relative instruction filenames.")
+    return script, admin, [relative(value, {".pdf", ".txt"}) for value in manuals]
 
 
 def source_url(url):
@@ -48,8 +72,8 @@ class CheckedRedirect(HTTPRedirectHandler):
         return super().redirect_request(req, fp, code, msg, headers, source_url(newurl))
 
 
-def open_url(url):
-    request = Request(source_url(url), headers={"User-Agent": f"ReleaseShelf/{__version__}"})
+def open_url(url, *, method=None):
+    request = Request(source_url(url), headers={"User-Agent": f"ReleaseShelf/{__version__}"}, method=method)
     return build_opener(CheckedRedirect()).open(request, timeout=30)
 
 
@@ -103,20 +127,40 @@ class Recipe:
     download_resolver: str = ""
     extract_folder: str = ""
     shortcut: str = ""
+    companion_dir: Path | None = None
+    apply_custom_settings: bool = False
+    settings_files: tuple | None = None
+    updates_disabled: bool = False
 
     @classmethod
     def read(cls, path):
-        return cls.from_data(json.loads(path.read_text(encoding="utf-8-sig")))
+        return cls.from_data(json.loads(path.read_text(encoding="utf-8-sig")), path=path)
 
     @classmethod
-    def from_data(cls, data):
+    def from_data(cls, data, *, path=None):
         if not isinstance(data, dict):
             raise ValueError("A recipe must be a JSON object")
+        companion_actions(data)
+        updates_disabled = data.get("updates_disabled", False)
+        if not isinstance(updates_disabled, bool):
+            raise ValueError("updates_disabled must be true or false")
         members = data.get("extract", [])
         if not isinstance(members, list):
             raise ValueError("extract must be a list of ZIP member filenames")
         names = tuple(filename(item) for item in members)
-        extract_folder = filename(data["extract_folder"]) if "extract_folder" in data else ""
+        apply_settings = data.get("apply_custom_settings", False)
+        if not isinstance(apply_settings, bool):
+            raise ValueError("apply_custom_settings must be true or false")
+        settings = data.get("settings_files")
+        if "settings_files" in data:
+            if not isinstance(settings, list) or not all(isinstance(p, str) for p in settings):
+                raise ValueError("settings_files must be a list of relative config filenames")
+            settings = tuple(Path(*(filename(part) for part in p.replace("\\", "/").split("/"))) for p in settings)
+            if any(p.suffix.lower() not in NAMED_CONFIG_SUFFIXES for p in settings):
+                raise ValueError("settings_files must name portable configuration files")
+        extract_folder = data.get("extract_folder", "")
+        if "extract_folder" in data and extract_folder != ".":
+            filename(extract_folder)
         shortcut = filename(data["shortcut"]) if "shortcut" in data else ""
         if extract_folder and not names:
             raise ValueError("A folder recipe must list its primary executable first in extract")
@@ -135,7 +179,12 @@ class Recipe:
         checksum = sha256(data["sha256"]) if "sha256" in data else None
         github = data.get("github", "")
         page = pattern = download = asset = archive = checksum_pattern = resolver = ""
-        if "github" in data:
+        if "direct_download" in data:
+            if any(key in data for key in ("github", "page", "version_pattern", "download", "download_resolver", "sha256_pattern")):
+                raise ValueError("Use one source per recipe")
+            download = source_url(data["direct_download"])
+            archive = filename(data.get("filename", unquote(urlsplit(download).path.rsplit("/", 1)[-1])))
+        elif "github" in data:
             if not re.fullmatch(r"[\w.-]+/[\w.-]+", github, re.ASCII) or any(
                     part in {".", ".."} for part in github.split("/")):
                 raise ValueError("github must be owner/repository")
@@ -149,7 +198,9 @@ class Recipe:
         else:
             page = source_url(data["page"])
             pattern = data["version_pattern"]
-            if re.compile(pattern).groups != 1:
+            compiled = re.compile(pattern)
+            has_asset = compiled.groups == 2 and compiled.groupindex.get("asset") == 2
+            if compiled.groups != 1 and not has_asset:
                 raise ValueError("version_pattern must have one version capture group")
             if "sha256_pattern" in data:
                 checksum_pattern = data["sha256_pattern"]
@@ -159,12 +210,14 @@ class Recipe:
                 resolver = data["download_resolver"]
                 if resolver != WINDOWS_ISO_RESOLVER or "download" in data:
                     raise ValueError("Choose one supported download source")
-                if page != "https://www.microsoft.com/en-us/software-download/windows11" or not checksum_pattern:
+                if page != WINDOWS_ISO_PAGE or not checksum_pattern:
                     raise ValueError("Windows 11 requires the Microsoft English download page and a SHA-256 pattern")
             else:
                 download = source_url(data["download"])
-                if "{version}" in urlsplit(download).netloc:
+                if any(token in urlsplit(download).netloc for token in ("{version}", "{asset}")):
                     raise ValueError("Use {version} in the download path or query")
+                if ("{asset}" in download) != has_asset:
+                    raise ValueError("Use {asset} with a second capture group named asset.")
             archive = filename(data.get("filename", unquote(urlsplit(download).path.rsplit("/", 1)[-1])))
         if names and archive.casefold() == "files":
             raise ValueError("The archive filename conflicts with the extraction folder")
@@ -186,10 +239,24 @@ class Recipe:
             metadata[key] = value.strip()
         return cls(job_id, page, pattern, download, archive, names, github, asset, product,
                    checksum, publish_exe, previous_ids=previous_ids, sha256_pattern=checksum_pattern,
-                   download_resolver=resolver, extract_folder=extract_folder, shortcut=shortcut, **metadata)
+                   download_resolver=resolver, extract_folder=extract_folder, shortcut=shortcut,
+                   apply_custom_settings=apply_settings, settings_files=settings, updates_disabled=updates_disabled,
+                   companion_dir=path.parent / "companions" / path.stem if path is not None else None, **metadata)
 
     def id_keys(self):
         return tuple(dict.fromkeys(value.casefold() for value in (self.id, *self.previous_ids)))
+
+    def is_portable_setting(self, relative):
+        if self.settings_files is not None:
+            return relative in self.settings_files
+        return len(relative.parts) == 1 and relative.suffix.lower() in CONFIG_SUFFIXES
+
+    def has_portable_settings(self):
+        if self.settings_files is not None:
+            return bool(self.settings_files)
+        folder = self.companion_dir
+        return bool(folder and folder.is_dir() and any(
+            self.is_portable_setting(p.relative_to(folder)) and p.is_file() for p in folder.iterdir()))
 
     def cache_root(self, dest):
         root = dest / self.id
@@ -222,12 +289,25 @@ class Recipe:
         return any(saved == self.fingerprint(value) for value in (self.id, *self.previous_ids))
 
     def resolve(self):
+        if self.download and not self.page:
+            with open_url(self.download, method="HEAD") as response:
+                modified = response.headers.get("Last-Modified")
+                if not modified:
+                    raise ValueError("The download has no Last-Modified header.")
+                version = parsedate_to_datetime(modified).astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+            return Release(version, self.download, self.archive, self.checksum)
         if not self.github:
             page = read_page(self.page)
             match = re.search(self.version_pattern, page)
             version = (match.group(1) or "").strip() if match else ""
             if not version:
                 raise ValueError("Available version unknown: version_pattern did not match the page")
+            download = self.download.replace("{version}", quote(version, safe=""))
+            if "{asset}" in self.download:
+                asset = match.group("asset")
+                if not asset:
+                    raise ValueError("The download asset pattern did not match the page.")
+                download = download.replace("{asset}", quote(asset, safe=""))
             checksum = self.checksum
             if self.sha256_pattern:
                 match = re.search(self.sha256_pattern, page)
@@ -240,7 +320,6 @@ class Recipe:
             archive = filename(self.archive.replace("{version}", version))
             if self.extract and archive.casefold() == "files":
                 raise ValueError("The archive filename conflicts with the extraction folder")
-            download = self.download.replace("{version}", quote(version, safe=""))
             return Release(version, download, archive, checksum)
 
         release = json.loads(read_page(f"https://api.github.com/repos/{self.github}/releases/latest"))
@@ -351,7 +430,9 @@ def response_chunks(response):
 def extract_windows_archive(recipe, release, archive, destination):
     """Read the Windows tar stream and create only validated directories and regular files."""
     tar = Path(os.environ["SystemRoot"]) / "System32" / "tar.exe"
-    prefix = filename(recipe.extract_folder.replace("{version}", release.version)) if recipe.extract_folder else ""
+    prefix = recipe.extract_folder.replace("{version}", release.version)
+    if prefix and recipe.extract_folder != ".":
+        filename(prefix)
     destination.mkdir()
     found = set()
     with tempfile.TemporaryFile() as errors, subprocess.Popen(
@@ -364,13 +445,13 @@ def extract_windows_archive(recipe, release, archive, destination):
                 for entry in stream:
                     check_canceled()
                     parts = entry.name.split("/")
-                    if prefix:
+                    if prefix and recipe.extract_folder != ".":
                         if parts[0] != prefix:
                             continue
                         parts = parts[1:]
                         if not parts and entry.isdir():
                             continue
-                    elif entry.name not in recipe.extract:
+                    elif not recipe.extract_folder and entry.name not in recipe.extract:
                         continue
                     path = destination.joinpath(*(filename(part) for part in parts))
                     if not parts or path == destination or path in found:

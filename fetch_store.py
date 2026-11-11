@@ -7,7 +7,8 @@ import shutil
 import tempfile
 import uuid
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from fnmatch import fnmatchcase
 from pathlib import Path
 
 from fetch_sources import digest, filename, stage_release
@@ -104,12 +105,161 @@ def tree_members(state):
             yield name
 
 
+def check_link(path):
+    if path.is_symlink() or path.is_junction():
+        raise ValueError(f"Unexpected link in item directory: {path}")
+
+
+def prune_legacy_archive(root, folder, recipe, output):
+    """Older builds could leave a second published copy of a versioned archive."""
+    if recipe.extract or output.path.parent != root / "current":
+        return
+    contents = list(folder.iterdir())
+    if len(contents) != 1:
+        return
+    archive = contents[0]
+    old = output.path.parent / archive.name
+    pattern = recipe.archive.replace("{version}", "*") or recipe.asset_pattern
+    if old == output.path or Path(old.name) in output.companions or not fnmatchcase(old.name, pattern):
+        return
+    check_link(old.parent)
+    check_link(old)
+    check_link(archive)
+    if (old.is_file() and archive.is_file() and old.stat().st_size == archive.stat().st_size
+            and digest(old) == digest(archive)):
+        old.unlink()
+
+
+def prune_releases(root, recipe, output, current, pending=None):
+    """Called under the fetch lock. Keep both sides of an unfinished publication."""
+    check_link(root)
+    releases = root / "releases"
+    check_link(releases)
+    keep = {entry["release"] for entry in (current, pending) if entry}
+    for folder in releases.iterdir():
+        if folder.name in keep or not re.fullmatch(r"[0-9a-f]{32}", folder.name):
+            continue
+        check_link(folder)
+        if folder.is_dir():
+            if not pending:
+                prune_legacy_archive(root, folder, recipe, output)
+            shutil.rmtree(folder)
+    previous = root / ".previous-app"
+    if current and not pending and previous.exists():
+        check_link(previous)
+        shutil.rmtree(previous)
+
+
+def remove_superseded_output(root, previous, output):
+    published = (previous or {}).get("published", {})
+    path = Path(published.get("path", ""))
+    if path == output.path or path.parent not in (root / "current", root / "bin"):
+        return
+    if path.parent == output.path.parent and (output.tree or Path(path.name) in output.companions):
+        return
+    # Only retire the managed primary if it still contains the bytes we published.
+    check_link(root)
+    check_link(path.parent)
+    check_link(path)
+    hashes = previous["sha256"]
+    checksum = hashes.get("files/" + path.name) or hashes.get(path.name)
+    if checksum and path.is_file() and digest(path) == checksum:
+        path.unlink()
+
+
+def companion_files(source, target):
+    files = {}
+    if source is None:
+        return files
+    check_link(source.parent)
+    check_link(source)
+    if not source.exists():
+        return files
+    if target.parent.resolve().is_relative_to(source.resolve()):
+        raise ValueError("The app folder must be outside its catalog companion folder.")
+
+    def collect(directory):
+        for path in directory.iterdir():
+            check_canceled()
+            check_link(path)
+            relative = path.relative_to(source)
+            live = target.parent / relative
+            check_link(live)
+            if relative.parts[0].casefold() == target.name.casefold():
+                raise ValueError(f"A companion file conflicts with the published item: {relative}")
+            if path.is_dir():
+                collect(path)
+            elif path.is_file():
+                files[relative] = path
+            else:
+                raise ValueError(f"Unsupported companion file: {path}")
+    check_link(target.parent)
+    collect(source)
+    return files
+
+
+def portable_settings(recipe, files):
+    settings = {p: source for p, source in files.items() if recipe.is_portable_setting(p)}
+    if recipe.apply_custom_settings:
+        for relative in recipe.settings_files or ():
+            if relative not in files:
+                raise ValueError(f"Missing portable config: {relative}")
+        if not settings:
+            raise ValueError("No portable configuration files found.")
+    return settings
+
+
+def apply_published_settings(recipe, dest):
+    """Apply the user's saved choice offline, or defer until the item is published."""
+    root = recipe.cache_root(dest)
+    if not recipe.apply_custom_settings or not (root / "current.json").exists():
+        return False
+    with fetch_lock(root):
+        state = read_state(root, "current.json") or {}
+        path = state.get("published", {}).get("path")
+        if not path or not recipe.matches_fingerprint(state.get("recipe")) or not Path(path).is_file():
+            return False
+        files = portable_settings(recipe, companion_files(recipe.companion_dir, Path(path)))
+        publish_companions(files, Path(path).parent, files, True)
+    return True
+
+
+def publish_companions(files, directory, settings, apply_settings):
+    """Seed support files once and replace only selected portable configurations."""
+    for relative, source in files.items():
+        target = directory / relative
+        setting = relative in settings
+        if setting and not apply_settings:
+            continue
+        if target.is_file() and (not setting or digest(target) == digest(source)):
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(dir=target.parent, prefix=".companion-", delete=False) as handle:
+            temp = Path(handle.name)
+        try:
+            shutil.copy2(source, temp)
+            if setting:
+                temp.replace(target)
+            elif os.name == "nt":
+                temp.rename(target)  # Refuses to overwrite a concurrently created file.
+            else:
+                os.link(temp, target)
+        except FileExistsError:
+            if setting or not target.is_file():
+                raise
+        finally:
+            temp.unlink(missing_ok=True)
+
+
 @dataclass(frozen=True)
 class Output:
     member: str
     path: Path
     tree: bool = False
     shortcut: Path | None = None
+    companions: dict = field(default_factory=dict)
+    settings: frozenset = frozenset()
+    apply_settings: bool = False
 
     @classmethod
     def for_release(cls, root, recipe, archive, override, state):
@@ -120,8 +270,27 @@ class Output:
             default = root / "bin" / recipe.publish_exe
         if recipe.extract_folder and override:
             raise ValueError("A file target cannot publish a complete folder. Remove this item's file mapping.")
-        return cls(member, override or default, bool(recipe.extract_folder),
-                   shortcut_path(recipe.shortcut) if recipe.shortcut else None)
+        target = override or default
+        tree = bool(recipe.extract_folder or (len(recipe.extract) > 1 and override is None))
+        files = companion_files(recipe.companion_dir, target)
+        settings = frozenset(portable_settings(recipe, files))
+        return cls(member, target, tree,
+                   shortcut_path(recipe.shortcut) if recipe.shortcut else None,
+                   files, settings, recipe.apply_custom_settings)
+
+    def companion_issue(self, state):
+        for relative, source in self.companions.items():
+            target = self.path.parent / relative
+            if relative in self.settings:
+                if self.apply_settings:
+                    if not target.is_file() or digest(target) != digest(source):
+                        return message("Apply custom settings: {path}", path=target)
+                    continue
+                if not self.tree or "files/" + relative.as_posix() not in state["sha256"]:
+                    continue
+            if not target.is_file():
+                return message("Missing file: {path}", path=target)
+        return ""
 
     def issue(self, state, full):
         published = state.get("published", {})
@@ -130,10 +299,17 @@ class Output:
         issue = file_issue(self.path, state["sha256"].get(self.member), published.get("stat"), full)
         if not issue and self.tree:
             for name in tree_members(state):
+                if Path(name[6:]) in self.companions:
+                    continue
                 issue = file_issue(self.path.parent / name[6:], state["sha256"][name],
                                    published.get("stats", {}).get(name), full)
                 if issue:
                     break
+        if not issue:
+            if issue := self.companion_issue(state):
+                return issue
+            if self.tree and sorted(p.as_posix() for p in self.companions) != published.get("companions", []):
+                return "Publish companion files"
         if not issue and self.shortcut:
             link = published.get("shortcut", {})
             if self.shortcut != Path(link.get("path", "")):
@@ -173,9 +349,9 @@ class PublishPending(Exception):
     pass
 
 
-def publish_tree(root, folder, state, target):
+def publish_tree(root, folder, state, output):
     """Switch the staged app into place, preserving files the user or app added."""
-    live = target.parent
+    live = output.path.parent
     previous = root / ".previous-app"
     if any(path.is_symlink() or path.is_junction() for path in (live, previous)):
         raise ValueError("Unexpected link at the item directory")
@@ -183,17 +359,44 @@ def publish_tree(root, folder, state, target):
         previous.rename(live)
     names = list(tree_members(state))
     old_state = read_state(root, "current.json") or {"sha256": {}}
-    old_files = {Path(name[6:]) for name in tree_members(old_state)}
-    obsolete = old_files.difference(Path(name[6:]) for name in names)
+    old_published = old_state.get("published", {})
+    old_files = {Path(name[6:]) for name in tree_members(old_state) if name in old_published.get("stats", {})}
+    if old_published.get("path") and Path(old_published["path"]).parent == live:
+        old_files.add(Path(Path(old_published["path"]).name))
+    managed = [name for name in names if Path(name[6:]) not in output.companions]
+    obsolete = old_files.difference((Path(name[6:]) for name in names), output.companions)
+    previous_companions = old_published.get("companions", [])
+    companions = sorted(p.as_posix() for p in output.companions)
     if (not any((live / path).exists() for path in obsolete)
-            and all(not file_issue(live / name[6:], state["sha256"][name], None, True) for name in names)):
-        return {name: stamp(live / name[6:]) for name in names}
+            and companions == previous_companions
+            and not output.companion_issue(state)
+            and all(not file_issue(live / name[6:], state["sha256"][name], None, True) for name in managed)):
+        return {name: stamp(live / name[6:]) for name in managed}
     with tempfile.TemporaryDirectory(dir=root, prefix=".publish-") as staging:
         ready = Path(staging) / "app"
         shutil.copytree(folder / "files", ready)
         for name in names:
             if digest(ready / name[6:]) != state["sha256"][name]:
                 raise ValueError(f"Invalid staged item file: {name}")
+        for relative, source in output.companions.items():
+            existing = live / relative
+            if existing.is_dir():
+                raise ValueError(f"Companion file conflicts with an existing directory: {relative}")
+            key = relative.as_posix()
+            # On first import replace a pristine publisher default with the saved settings.
+            old_default = old_state["sha256"].get("files/" + key)
+            if relative in output.settings:
+                if not output.apply_settings:
+                    if not existing.is_file():
+                        continue  # Keep the package default, if the publisher supplies one.
+                    source = existing
+            elif existing.is_file() and (key in previous_companions or not old_default or digest(existing) != old_default):
+                source = existing
+            destination = ready / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            if destination.is_dir():
+                raise ValueError(f"Companion file conflicts with a package directory: {relative}")
+            shutil.copy2(source, destination)
         if live.exists():
             for path in live.rglob("*"):
                 relative = path.relative_to(live)
@@ -215,11 +418,10 @@ def publish_tree(root, folder, state, target):
             if previous.exists():
                 previous.rename(live)
             raise
-    # Keep the old directory until the next publication in case files are still open.
-    return {name: stamp(live / name[6:]) for name in names}
+    return {name: stamp(live / name[6:]) for name in managed}
 
 
-def publish(root, recipe, state, output, archive):
+def publish(root, recipe, state, output, archive, previous):
     folder = root / "releases" / state["release"]
     state["archive"] = archive
     if "stats" not in state:
@@ -243,16 +445,21 @@ def publish(root, recipe, state, output, archive):
         write_state(root / "pending.json", state)
         with cancel_scope(None):
             if output.tree:
-                stats = publish_tree(root, folder, state, target)
-            elif temp is not None:
-                os.replace(temp, target)
+                stats = publish_tree(root, folder, state, output)
+            else:
+                publish_companions(output.companions, target.parent, output.settings, output.apply_settings)
+                if temp is not None:
+                    os.replace(temp, target)
             state["published"] = {"path": str(target), "stat": stamp(target)}
             if output.tree:
                 state["published"]["stats"] = stats
+                if output.companions:
+                    state["published"]["companions"] = sorted(p.as_posix() for p in output.companions)
             if output.shortcut:
                 write_shortcut(output.shortcut, target)
                 state["published"]["shortcut"] = {"path": str(output.shortcut), "stat": stamp(output.shortcut),
                                                   "sha256": digest(output.shortcut)}
+            remove_superseded_output(root, previous, output)
     except ValueError:
         # Keep a verified release available for retry if the publication copy is damaged.
         write_state(root / "pending.json", state)
@@ -287,6 +494,8 @@ def run_release(action, root, recipe, release, override, on_progress=None, *, de
     if same and not issue:
         issue = output.issue(state, action == "fetch")
         if not issue and pending is None:
+            if action == "fetch":
+                prune_releases(root, recipe, output, state)
             return Result("Latest", local, release.version, str(output.path))
 
     if not state:
@@ -303,7 +512,7 @@ def run_release(action, root, recipe, release, override, on_progress=None, *, de
     candidate = None
     for entry in (pending, state):
         if matches(entry, recipe, release) and not cache_issue(root, recipe, entry, release.archive, True):
-            candidate = entry
+            candidate = entry.copy()
             break
     if candidate is None:
         if defer_download:
@@ -319,13 +528,16 @@ def run_release(action, root, recipe, release, override, on_progress=None, *, de
     else:
         status = "Cached"
     try:
-        publish(root, recipe, candidate, output, release.archive)
+        publish(root, recipe, candidate, output, release.archive, state)
     except JobCanceled:
         if status == "Updated":
             shutil.rmtree(root / "releases" / candidate["release"])
         raise
     except PublishPending as exc:
+        prune_releases(root, recipe, output, state, candidate)
         return Result("Pending", local, release.version, error_detail(exc))
+    with cancel_scope(None):
+        prune_releases(root, recipe, output, candidate)
     detail = message("Fetch needed: {reason}\n{path}", reason=reason, path=output.path)
     return Result(status, release.version, release.version, detail)
 

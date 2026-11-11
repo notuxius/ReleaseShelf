@@ -16,6 +16,9 @@ import unittest
 from unittest.mock import patch
 
 from fetch_store import Result
+from shelf_categories import MOVE, RENAME, CategoryDialog, change_category
+from shelf_delete import DELETE, DATA, FOLDER, delete_item, deletion_plan
+from shelf_checkboxes import header_image
 from shelf_window import ShelfWindow
 from shelf_i18n import LANGUAGES, catalog, tr
 from shelf_options import read_language
@@ -97,15 +100,21 @@ class DesktopTest(unittest.TestCase):
             tabs.select(next(tab for tab in tabs.tabs() if tabs.tab(tab, "text") == tr(tab_name)))
         return editor
 
-    def right_click_app(self, key):
+    def right_click_app(self, key, *, cancel_for=None):
         self.root.deiconify()
         self.root.update()
         tree = self.ui.tree
         x, y, width, height = tree.bbox(key, "Name")
         tree.event_generate("<Button-3>", x=x + width // 2, y=y + height // 2)
         self.root.update()
-        self.assertTrue(self.ui.app_menu.winfo_viewable())
-        return self.ui.app_menu
+        menu = self.ui.app_menu
+        self.assertTrue(menu.winfo_viewable())
+        toggle = "Enable updates" if getattr(self.ui.jobs[key], "updates_disabled", False) else "Disable updates"
+        labels = ("Check for updates", "Get updates", "Verify files", toggle,
+                  "Open app folder", MOVE, "Edit item", DELETE, DATA, FOLDER)
+        self.assertEqual([button.cget("text") for button in menu.buttons.values()],
+                         [tr("Cancel" if label == cancel_for else label) for label in labels])
+        return menu
 
     def click(self, button):
         # An editor closed during this test may still have cyclic Tk widget references.
@@ -126,6 +135,121 @@ class DesktopTest(unittest.TestCase):
             self.root.update()
             sleep(.005)
         self.assertTrue(condition())
+
+    def test_right_click_opens_clicked_apps_published_folder(self):
+        first, second = self.keys
+        root = self.ui.jobs[second].cache_root(self.dest)
+        root.mkdir(parents=True)
+        folder = self.dest / "custom output"
+        folder.mkdir()
+        (root / "current.json").write_text(json.dumps({
+            "version": "1", "release": "a" * 32, "sha256": {}, "published": {"path": str(folder / "app.exe")},
+        }))
+        self.ui.tree.selection_set(first)
+        with patch("shelf_window.os.startfile", create=True) as launch:
+            self.right_click_app(second).buttons["Open app folder"].invoke()
+            launch.assert_called_once_with(folder)
+            self.right_click_app(first).buttons["Open app folder"].invoke()
+            launch.assert_called_once()
+            self.assertIn("Get updates", self.ui.status.get())
+
+    def test_disable_and_enable_from_sidebar(self):
+        ui = self.ui
+        first, second = self.keys
+        ui.results[first] = Result("Update available")
+        self.right_click_app(first).buttons["Disable updates"].invoke()
+        self.assertEqual(ui.view_counts["updates"].get(), "0")
+        self.assertEqual(ui.nav_buttons["disabled"].winfo_manager(), "grid")
+        ui.nav_buttons["disabled"].invoke()
+        self.assertEqual(ui.tree.get_children(), (first,))
+        self.assertEqual(ui.view_counts["disabled"].get(), "1")
+        ui.search.set("beta")
+        self.assertFalse(ui.tree.get_children())
+        self.assertEqual(ui.nav_buttons["disabled"].winfo_manager(), "grid")
+        ui.search.set("")
+        ui.reload()
+        self.assertEqual(ui.tree.get_children(), (first,))
+        self.assertEqual(ui.tree.set(first, "Status"), "Disabled")
+        ui.start("fetch", key=first)
+        self.assertFalse(ui.busy)
+        ui.open_editor(Path(first))
+        self.assertTrue(ui.editor.buttons["check"].instate(["disabled"]))
+        self.assertTrue(ui.editor.buttons["verify"].instate(["!disabled"]))
+        ui.editor.destroy()
+        with patch("shelf_window.execute", return_value=Result("Latest")) as execute:
+            self.click(ui.all_buttons["check"])
+            self.assertEqual([call.args[1] for call in execute.call_args_list], [ui.jobs[second]])
+        menu = self.right_click_app(first)
+        self.assertTrue(menu.buttons["Get updates"].instate(["disabled"]))
+        self.assertTrue(menu.buttons["Verify files"].instate(["!disabled"]))
+        menu.buttons["Disable updates"].invoke()
+        self.assertFalse(ui.nav_buttons["disabled"].winfo_manager())
+        self.assertEqual(ui.view.get(), "all")
+        self.assertEqual(ui.tree.get_children(), self.keys)
+        ui.reload()
+        self.assertFalse(ui.jobs[first].updates_disabled)
+
+    def test_local_view_includes_missing_paths(self):
+        path = self.ui.catalog / "local.json"
+        path.write_text(json.dumps({"id": "local", "local_path": "missing"}))
+        self.ui.reload()
+        self.ui.nav_buttons["local"].invoke()
+        self.assertEqual(self.ui.tree.get_children(), (str(path),))
+        self.assertEqual(self.ui.view_counts["local"].get(), "1")
+        self.assertEqual(self.ui.tree.set(str(path), "Status"), "Error")
+        self.assertTrue(self.right_click_app(str(path)).buttons["Disable updates"].instate(["disabled"]))
+
+    def test_local_item_opens_folder_and_edits_without_enabling_updates(self):
+        path = self.ui.catalog / "local.json"
+        path.write_text(json.dumps({"id": "local", "category": "Hardware", "local_path": "."}))
+        self.ui.reload(saved=str(path))
+        key = str(path)
+        self.assertEqual(self.ui.tree.set(key, "Status"), "Local only")
+        with patch("shelf_window.os.startfile", create=True) as launch:
+            menu = self.right_click_app(key)
+            self.assertTrue(menu.buttons["Check for updates"].instate(["disabled"]))
+            menu.buttons["Open app folder"].invoke()
+            launch.assert_called_once_with(self.ui.catalog)
+        self.ui.open_editor(path)
+        editor = self.ui.editor
+        self.assertEqual(editor.source.get(), "Local file or folder")
+        editor.fields["category"].set("Utilities")
+        editor.save()
+        self.assertEqual(json.loads(path.read_text()), {"id": "local", "category": "Utilities", "local_path": "."})
+
+    def test_apply_custom_settings_checkbox(self):
+        path = Path(self.keys[0])
+        self.ui.tree.selection_set(str(path))
+        seeds = self.ui.catalog / "companions" / path.stem
+        seeds.mkdir(parents=True)
+        (seeds / "app.ini").write_text("saved configuration")
+        editor = self.edit_selected()
+        self.assertFalse(editor.apply_settings.get())
+        editor.settings_button.invoke()
+        editor.save_button.invoke()
+        self.assertIn("Get updates", self.ui.status.get())
+        job = self.ui.jobs[str(path)]
+        root = job.cache_root(self.dest)
+        live = root / "current"
+        live.mkdir(parents=True)
+        target = live / "app.exe"
+        target.write_bytes(b"app")
+        (root / "current.json").write_text(json.dumps({"version": "1", "release": "a" * 32,
+            "sha256": {}, "recipe": job.fingerprint(), "published": {"path": str(target)}}))
+        (live / "app.ini").write_text("old")
+        editor = self.edit_selected()
+        self.assertTrue(editor.apply_settings.get())
+        editor.save_button.invoke()
+        self.assertEqual((live / "app.ini").read_text(), "saved configuration")
+        self.assertIn("applied", self.ui.status.get())
+        editor = self.edit_selected()
+        editor.settings_button.invoke()
+        (live / "app.ini").write_text("local edit")
+        editor.save_button.invoke()
+        self.assertEqual((live / "app.ini").read_text(), "local edit")
+        (seeds / "app.ini").unlink()
+        (seeds / "restore.ps1").touch()
+        self.assertFalse(hasattr(self.edit_selected(), "settings_button"))
 
     def test_language_selector_translates_live_and_survives_restart(self):
         key = self.keys[1]
@@ -217,6 +341,225 @@ class DesktopTest(unittest.TestCase):
         self.assertEqual(trigger.cget("text"), "Deutsch")
         self.assertEqual(read_language(self.ui.language_file), "de")
 
+    @unittest.skipUnless(sys.platform == "win32", "Shell actions require Windows")
+    def test_companion_buttons_are_explicit_and_reveal_the_selected_manual(self):
+        path = Path(self.keys[0])
+        data = json.loads(path.read_text())
+        data.update(restore_script="Restore.ps1", manual_files=["Settings/Instructions.txt"])
+        path.write_text(json.dumps(data))
+        folder = self.ui.catalog / "companions" / path.stem
+        manual = folder / data["manual_files"][0]
+        manual.parent.mkdir(parents=True)
+        manual.write_text("Example")
+        (folder / data["restore_script"]).write_text("Write-Output 'Example'")
+        with patch("companion_buttons.os.startfile", create=True) as launch:
+            self.ui.open_editor(path)
+            dialog = self.ui.editor
+            buttons = {str(w.cget("text")): w for w in descendants(dialog) if isinstance(w, ttk.Button)}
+            launch.assert_not_called()
+            for label in ("Open companion files", "Open app folder", "Open instructions"):
+                self.assertNotIn(label, buttons)
+            buttons["Show in folder"].invoke()
+            self.assertEqual(launch.call_args.kwargs["arguments"], f'/select,"{manual}"')
+            buttons["Run restore script"].invoke()
+            self.assertEqual(launch.call_args.args[1], "open")
+            self.assertEqual(launch.call_args.args[3], str(folder))
+            manual.unlink()
+            buttons["Show in folder"].invoke()
+            self.assertIn("Missing companion file", dialog.error.get())
+            dialog.save_button.invoke()
+            self.assertEqual(launch.call_count, 2)
+
+    def test_companion_actions_reject_escaping_paths_and_mismatched_file_types(self):
+        from fetch_sources import companion_actions
+        for data in ({"restore_script": "../other.ps1"}, {"restore_script": "C:/other.ps1"},
+                     {"restore_script": "other.exe"}, {"manual_files": ["other.ps1"]},
+                     {"restore_script": "folder/../x.ps1"}, {"restore_as_admin": True}):
+            with self.subTest(data=data), self.assertRaises(ValueError):
+                companion_actions(data)
+
+    @unittest.skipUnless(sys.platform == "win32", "Local PowerShell actions require Windows")
+    def test_checklist_only_applies_explicit_choices(self):
+        from releaseshelf import main
+
+        path = self.ui.catalog / "setup.json"
+        log = self.ui.catalog / "actions.txt"
+        steps = [{"label": name, "description": name, "powershell": script} for name, script in (
+            ("one", "'one' | Add-Content actions.txt"),
+            ("skip", "'skip' | Add-Content actions.txt"),
+            ("failure", "throw 'sample failure'"),
+            ("last", "'last' | Add-Content actions.txt"))]
+        path.write_text(json.dumps({"type": "checklist", "id": "setup", "name": "Setup",
+                                    "category": "Tools", "steps": steps}))
+        self.ui.reload(saved=str(path))
+        self.assertEqual(self.ui.tree.get_children(), self.keys)
+        self.assertEqual(self.ui.view_counts["all"].get(), "2")
+        catalog_columns = self.ui.tree["displaycolumns"]
+        self.assertFalse(any(str(path) in keys for keys in self.ui.category_groups.values()))
+        checklist = self.ui.nav_buttons["checklist"]
+        self.assertLess(int(checklist.grid_info()["row"]), int(self.ui.nav_buttons["all"].grid_info()["row"]))
+        checklist.invoke()
+        self.assertEqual(self.ui.view_counts["checklist"].get(), "1")
+        self.assertEqual(self.ui.tree.get_children(), (str(path),))
+        self.assertEqual(self.ui.tree["displaycolumns"], ("Name", "Status"))
+        self.assertEqual(self.ui.tree.set(str(path), "Status"), "Not applied")
+        self.assertEqual(self.ui.count.cget("text"), "1 item")
+        self.root.deiconify()
+        self.ui.open_editor(path)
+        dialog = self.ui.editor
+        self.assertTrue(dialog.apply_button.instate(["disabled"]))
+        self.assertEqual(dialog.selected, [False] * 4)
+        self.click_checkbox_header(dialog.listing)
+        self.assertEqual(dialog.selected, [True] * 4)
+        self.click_checkbox_header(dialog.listing)
+        self.assertEqual(dialog.selected, [False] * 4)
+        self.click_checkbox_header(dialog.listing)
+        dialog.toggle(1)
+        self.assertEqual(dialog.listing.tk.splitlist(dialog.listing.heading("#0", "image")), (header_image(3, 4),))
+        dialog.save_button.invoke()
+        with patch("shelf_window.execute", return_value=Result("Verified")) as verify:
+            self.click(self.ui.bulk_buttons["verify"])
+            self.assertEqual(verify.call_count, 2)
+        with patch("releaseshelf.execute", return_value=Result("Verified")) as verify:
+            self.assertEqual(main(["verify", "--all", "--catalog", str(self.ui.catalog)]), 0)
+            self.assertEqual(verify.call_count, 2)
+        self.assertFalse(log.exists())
+        self.ui.open_editor(path)
+        dialog = self.ui.editor
+        self.assertEqual(dialog.selected, [True, False, True, True])
+        dialog.apply_button.invoke()
+        self.assertTrue(dialog.running)
+        self.assertTrue(dialog.apply_button.instate(["disabled"]))
+        self.wait_for(lambda: not dialog.running)
+        self.assertEqual(log.read_text().splitlines(), ["one", "last"])
+        self.assertEqual(dialog.listing.set("2", "result"), "Error")
+        self.assertIn("sample failure", dialog.outputs[2])
+        self.assertEqual(dialog.listing.set("1", "result"), "Not applied")
+        self.assertEqual(dialog.listing.set("3", "result"), "Applied")
+        self.assertEqual(self.ui.tree.set(str(path), "Status"), "Error")
+        self.assertEqual(self.ui.view_counts["attention"].get(), "0")
+        self.ui.select_view("all")
+        self.assertEqual(self.ui.tree["displaycolumns"], catalog_columns)
+        self.assertEqual(self.ui.tree.get_children(), self.keys)
+        checklist.invoke()
+        dialog.toggle(0)
+        dialog.toggle(3)
+        with patch("shelf_checklist.apply_step", return_value="ok"):
+            dialog.apply_button.invoke()
+            self.wait_for(lambda: not dialog.running)
+            self.assertEqual(self.ui.tree.set(str(path), "Status"), "Partially applied")
+            dialog.toggle(2)
+            dialog.toggle(1)
+            dialog.apply_button.invoke()
+            self.wait_for(lambda: not dialog.running)
+        self.ui.reload()
+        self.assertEqual(self.ui.tree.set(str(path), "Status"), "Applied")
+        second = tk.Toplevel(self.root)
+        self.addCleanup(second.destroy)
+        reopened = ShelfWindow(second, self.ui.catalog, self.dest, self.ui.targets, appearance_file=self.appearance)
+        reopened.select_view("checklist")
+        self.assertEqual(reopened.tree.set(str(path), "Status"), "Applied")
+        path.write_text(path.read_text() + "\n")
+        dialog.apply_button.invoke()
+        self.assertFalse(dialog.running)
+        self.assertIn("changed on disk", dialog.error.get())
+        self.assertEqual(log.read_text().splitlines(), ["one", "last"])
+
+    def test_checklist_toolbar_uses_checked_rows_and_all_rows_across_search(self):
+        ui, tree = self.ui, self.ui.tree
+        keys = []
+        for name in ("first", "second"):
+            path = ui.catalog / f"{name}.json"
+            steps = [{"label": name + suffix, "description": name, "powershell": "unused"}
+                     for suffix in ("1", "2")]
+            path.write_text(json.dumps({"id": name, "type": "checklist", "steps": steps}))
+            keys.append(str(path))
+        ui.reload()
+        ui.select_view("checklist")
+        self.root.deiconify()
+        self.root.update()
+        selected, apply_all = (ui.all_buttons[action] for action in ("apply_selected", "apply_all"))
+        self.assertFalse(ui.all_buttons["check"].winfo_ismapped())
+        self.assertFalse(ui.all_buttons["fetch"].winfo_ismapped())
+        self.assertTrue(selected.winfo_ismapped() and apply_all.winfo_ismapped())
+        self.assertTrue(selected.instate(["disabled"]))
+        x, y, w, h = tree.bbox(keys[0], "#0")
+        self.assertIn("image", tree.identify_element(x + w // 2, y + h // 2))
+        tree.event_generate("<Button-1>", x=x + w // 2, y=y + h // 2)
+        tree.event_generate("<ButtonRelease-1>", x=x + w // 2, y=y + h // 2)
+        self.assertTrue(tree.tag_has("checked", keys[0]))
+        tree.focus_force()
+        self.root.update()
+        tree.event_generate("<space>")
+        self.assertTrue(selected.instate(["disabled"]))
+        tree.event_generate("<space>")
+        ui.search.set("second")
+        self.assertEqual(tree.get_children(), (keys[1],))
+        with patch("shelf_checklist.apply_step", return_value="ok") as apply:
+            self.click(selected)
+            self.assertEqual([c.args[0].label for c in apply.call_args_list], ["first1", "first2"])
+            self.assertEqual(tree.set(keys[0], "Status"), "Applied")
+            self.assertEqual(tree.set(keys[1], "Status"), "Not applied")
+            apply.reset_mock()
+            self.click(apply_all)
+            self.assertEqual([c.args[0].label for c in apply.call_args_list],
+                             ["first1", "first2", "second1", "second2"])
+        self.assertEqual(tree.set(keys[1], "Status"), "Applied")
+        self.assertEqual(ui.checked_items, {keys[0]})
+        ui.show_app_icons.set(True)
+        ui.change_app_icons()
+        self.assertEqual(tree.tk.splitlist(tree.heading("#0", "image")), (header_image(0, 1),))
+        ui.select_view("all")
+        self.root.update()
+        self.assertTrue(ui.all_buttons["check"].winfo_ismapped())
+        self.assertFalse(selected.winfo_ismapped())
+        ui.select_view("checklist")
+        ui.search.set("")
+        self.assertTrue(tree.tag_has("checked", keys[0]))
+        self.assertEqual(tree.tk.splitlist(tree.heading("#0", "image")), (header_image(1, 2),))
+        self.click_checkbox_header(tree)
+        self.assertEqual(ui.checked_items, set(keys))
+        self.assertEqual(tree.tk.splitlist(tree.heading("#0", "image")), (header_image(2, 2),))
+        ui.search.set("second")
+        self.click_checkbox_header(tree)
+        self.assertEqual(ui.checked_items, {keys[0]})
+        ui.search.set("no match")
+        self.assertEqual(tree.tk.splitlist(tree.heading("#0", "image")), (header_image(0, 0),))
+        ui.search.set("")
+        self.click_checkbox_header(tree)
+        self.click_checkbox_header(tree)
+        self.assertFalse(ui.checked_items)
+
+    def click_checkbox_header(self, tree):
+        self.root.update()
+        x = tree.column("#0", "width") // 2
+        self.assertEqual(tree.identify_region(x, 10), "heading")
+        tree.event_generate("<Motion>", x=x, y=10)
+        tree.event_generate("<Button-1>", x=x, y=10)
+        tree.event_generate("<ButtonRelease-1>", x=x, y=10)
+        self.root.update()
+
+    def test_cancel_checklist_batch_finishes_current_step_and_records_partial_status(self):
+        path = self.ui.catalog / "setup.json"
+        path.write_text(json.dumps({"id": "setup", "type": "checklist", "steps": [
+            {"label": name, "description": name, "powershell": "unused"} for name in ("one", "two")]}))
+        self.ui.reload()
+        self.ui.select_view("checklist")
+        step = GatedPage()
+        button = self.ui.all_buttons["apply_all"]
+        with patch("shelf_checklist.apply_step", side_effect=step) as apply:
+            button.invoke()
+            try:
+                self.wait_for(step.entered.is_set)
+                self.assertEqual(button.cget("text"), "Cancel")
+                button.invoke()
+            finally:
+                step.resume.set()
+                self.wait_until_idle()
+            self.assertEqual([c.args[0].label for c in apply.call_args_list], ["one"])
+        self.assertEqual(self.ui.tree.set(str(path), "Status"), "Partially applied")
+        self.assertIn("1 canceled", self.ui.status.get())
+
     def test_invalid_language_preference_uses_english(self):
         self.ui.language_file.parent.mkdir(parents=True, exist_ok=True)
         for contents in (b"unknown", b"", b"\xff"):
@@ -264,6 +607,115 @@ class DesktopTest(unittest.TestCase):
         self.assertFalse(menu.winfo_viewable())
         self.assertEqual(self.ui.results[second].status, "Repair needed")
         self.assertEqual(self.ui.results[first].status, "Not checked")
+
+    def test_delete_local_file_scope_and_confirmation(self):
+        path = self.ui.catalog / "local.json"
+        app = self.dest.parent / "portable" / "tool.exe"
+        folder = app.parent
+        settings = folder / "settings.ini"
+        for mode in (DELETE, DATA, FOLDER):
+            with self.subTest(mode=mode):
+                folder.mkdir(exist_ok=True)
+                app.write_bytes(b"app")
+                settings.write_text("settings")
+                path.write_text(json.dumps({"id": "local", "local_path": str(app)}))
+                self.ui.reload()
+                with patch("shelf_window.messagebox.askyesno", return_value=False) as confirm:
+                    self.right_click_app(str(path)).buttons[mode].invoke()
+                    self.assertTrue(path.exists() and app.exists() and settings.exists())
+                    self.assertEqual(confirm.call_args.kwargs["default"], "no")
+                    if mode != DELETE:
+                        expected = folder if mode == FOLDER else app
+                        self.assertIn(str(expected), confirm.call_args.kwargs["detail"].splitlines())
+                with patch("shelf_window.messagebox.askyesno", return_value=True):
+                    self.right_click_app(str(path)).buttons[mode].invoke()
+                self.assertNotIn(str(path), self.ui.jobs)
+                self.assertFalse(path.exists())
+                self.assertEqual(app.exists(), mode == DELETE)
+                self.assertEqual(settings.exists(), mode != FOLDER)
+                self.assertEqual(folder.exists(), mode != FOLDER)
+                self.assertEqual(set(self.ui.tree.get_children()), set(self.keys))
+
+    def test_delete_download_separates_payload_and_settings(self):
+        path = Path(self.keys[0])
+        root = self.dest / "old-id"
+        live = root / "current"
+        live.mkdir(parents=True)
+        payload = ("tool.exe", "support.dll", "settings.ini", "manual.txt")
+        for name in (*payload, "user.log"):
+            (live / name).write_text(name)
+        raw = json.loads(path.read_text())
+        raw["previous_ids"] = ["old-id"]
+        path.write_text(json.dumps(raw))
+        companions = self.ui.catalog / "companions" / path.stem
+        companions.mkdir(parents=True)
+        (companions / "manual.txt").write_text("instructions")
+        release = "a" * 32
+        saved = root / "releases" / release
+        saved.mkdir(parents=True)
+        (saved / "download.zip").write_bytes(b"cache")
+        hashes = {"files/" + name: "hash" for name in payload}
+        manifest = {"release": release, "version": "1", "sha256": hashes,
+                    "published": {"path": str(live / "tool.exe"), "stats": hashes, "companions": ["manual.txt"]}}
+        (root / "current.json").write_text(json.dumps(manifest))
+        self.ui.reload()
+        with patch("shelf_window.messagebox.askyesno", return_value=True):
+            self.right_click_app(str(path)).buttons[DATA].invoke()
+        self.assertFalse(path.exists() or saved.exists() or (root / "current.json").exists())
+        self.assertEqual({p.name for p in live.iterdir()}, {"settings.ini", "manual.txt", "user.log"})
+        self.assertTrue((companions / "manual.txt").exists())
+
+    def test_stale_delete_confirmation_keeps_replacement(self):
+        path = Path(self.keys[0])
+
+        def replace(*args, **kwargs):
+            path.write_text(json.dumps({"id": "replacement", "local_path": str(self.dest)}))
+            return True
+
+        with patch("shelf_window.messagebox.askyesno", side_effect=replace):
+            self.right_click_app(str(path)).buttons[DELETE].invoke()
+        self.assertEqual(json.loads(path.read_text())["id"], "replacement")
+
+    def test_external_download_folder_and_retry_after_locked_file(self):
+        path = Path(self.keys[0])
+        job = self.ui.jobs[str(path)]
+        root = self.dest / job.id
+        root.mkdir(parents=True)
+        app = self.dest.parent / "mapped" / "tool.exe"
+        app.parent.mkdir()
+        app.write_bytes(b"app")
+        settings = app.with_suffix(".ini")
+        settings.write_text("personal")
+        targets = self.ui.targets
+        targets.write_text(json.dumps({job.id: str(app)}))
+        manifest = root / "current.json"
+        manifest.write_text(json.dumps({"release": "a" * 32, "version": "1", "sha256": {},
+                                        "published": {"path": str(app)}}))
+        original = path.read_bytes()
+        plan = deletion_plan(DATA, path, job, self.dest, targets)
+        self.assertEqual(plan.files, (app,))
+        with patch.object(Path, "unlink", side_effect=PermissionError("locked")), self.assertRaises(PermissionError):
+            delete_item(DATA, path, job, original, plan, self.dest, targets)
+        self.assertTrue(path.exists() and manifest.exists() and settings.exists())
+        full = deletion_plan(FOLDER, path, job, self.dest, targets)
+        self.assertEqual(full.folders, (app.parent,))
+        delete_item(FOLDER, path, job, original, full, self.dest, targets)
+        self.assertFalse(app.parent.exists() or path.exists() or manifest.exists())
+        self.assertEqual(json.loads(targets.read_text()), {job.id: str(app)})
+
+    def test_local_folder_deletion_requires_the_folder_command(self):
+        path = Path(self.keys[0])
+        folder = self.dest.parent / "local folder"
+        folder.mkdir()
+        (folder / "my settings").touch()
+        path.write_text(json.dumps({"id": "local", "local_path": str(folder)}))
+        self.ui.reload()
+        job = self.ui.jobs[str(path)]
+        with self.assertRaisesRegex(ValueError, "Delete entire app folder"):
+            deletion_plan(DATA, path, job, self.dest, self.ui.targets)
+        full = deletion_plan(FOLDER, path, job, self.dest, self.ui.targets)
+        delete_item(FOLDER, path, job, path.read_bytes(), full, self.dest, self.ui.targets)
+        self.assertFalse(folder.exists() or path.exists())
 
     def test_right_click_below_rows_leaves_selection_alone(self):
         self.root.deiconify()
@@ -589,6 +1041,30 @@ class DesktopTest(unittest.TestCase):
         self.assertEqual(right_edge(tree), bar.winfo_rootx())
         self.assertEqual(tree.xview(), (0.0, 1.0))
 
+    def test_clipped_catalog_text_refits_and_full_values_remain_searchable(self):
+        ui = self.ui
+        path = Path(self.keys[0])
+        name = "Desktop application with a searchable suffix"
+        category = "Long category name " * 5 + "Utilities"
+        data = {**json.loads(path.read_text()), "name": name, "category": category}
+        path.write_text(json.dumps(data))
+        ui.reload()
+        self.root.geometry("760x430")
+        self.root.deiconify()
+        self.root.update()
+
+        tree = ui.tree
+        self.assertTrue(tree.set(str(path), "Name").endswith("..."))
+        self.assertTrue(ui.category_list.set("category:" + category, "name").endswith("..."))
+        ui.search.set("searchable suffix")
+        self.assertEqual(tree.get_children(), (str(path),))
+        for column in tree["columns"][1:]:
+            ui.column_menu.buttons[column].invoke()
+        self.root.geometry("1120x680")
+        self.root.update()
+        self.assertEqual(tree.set(str(path), "Name"), name)
+        self.assertEqual(ui.name(str(path)), name)
+
     def test_last_visible_column_can_restore_others_after_restart(self):
         tree = self.ui.tree
         columns = tree["columns"]
@@ -672,6 +1148,134 @@ class DesktopTest(unittest.TestCase):
                 self.root.update()
                 self.assertEqual((options.winfo_geometry(), toggle.winfo_geometry()), expanded)
 
+    def test_options_follows_last_category_row_after_scrolling_and_resizing(self):
+        self.root.deiconify()
+        listing = self.ui.category_list
+        recipe = json.loads(Path(self.keys[0]).read_text())
+        for count in (1, 24):
+            for number in range(1, count):
+                recipe.update(id=f"tool-{number}", category=f"Group {number:02}")
+                (self.ui.catalog / f"tool-{number}.json").write_text(json.dumps(recipe))
+            self.ui.reload()
+            for height in (680, 557, 430):
+                with self.subTest(categories=count, height=height):
+                    self.root.geometry(f"1120x{height}")
+                    self.root.update()
+                    listing.yview_moveto(1)
+                    self.root.update()
+                    last = listing.get_children()[-1]
+                    _, y, _, h = listing.bbox(last)
+                    bottom = y + h
+                    self.assertEqual(bottom, listing.winfo_height())
+                    options = self.ui.options_button
+                    gap = options.winfo_rooty() - (listing.winfo_rooty() + bottom)
+                    self.assertIn(gap, range(5))
+                    self.assertLessEqual(options.winfo_rooty() + options.winfo_height(),
+                                         self.root.winfo_rooty() + self.root.winfo_height())
+                    self.assert_scrollbar_visible(listing, count == 24)
+
+    def test_category_count_column_grows_for_two_digits(self):
+        listing = self.ui.category_list
+        initial_width = listing.column("count", "width")
+        recipe = json.loads(Path(self.keys[0]).read_text())
+        for number in range(8):
+            recipe["id"] = f"tool-{number}"
+            (self.ui.catalog / f"tool-{number}.json").write_text(json.dumps(recipe))
+        self.ui.reload()
+        self.root.deiconify()
+        self.root.update()
+        category, = listing.get_children()
+        self.assertEqual(listing.set(category, "count"), "10")
+        x, _, width, _ = listing.bbox(category, "count")
+        self.assertGreater(width, initial_width)
+        self.assertLessEqual(x + width, listing.winfo_width())
+
+    def test_edit_item_category_picker_lists_catalog_and_accepts_new_names(self):
+        first, second = map(Path, self.keys)
+        for path, category in ((first, "Utilities"), (second, "audio")):
+            data = json.loads(path.read_text())
+            path.write_text(json.dumps({**data, "category": category}))
+        self.root.deiconify()
+        self.ui.open_editor(first)
+        editor = self.ui.editor
+        combo = next(w for w in descendants(editor) if isinstance(w, ttk.Combobox))
+        self.assertEqual(combo["values"], ("audio", "Utilities"))
+        self.assertEqual(combo.get(), "Utilities")
+        self.root.update()
+        combo.tk.call("ttk::combobox::Post", combo)
+        self.root.update()
+        listing = f"{combo}.popdown.f.l"
+        self.assertEqual(combo.tk.call(listing, "cget", "-background"), self.ui.palette.surface)
+        self.assertEqual(combo.tk.call(listing, "cget", "-selectbackground"), self.ui.palette.selection)
+        combo.tk.call("event", "generate", listing, "<Up>")
+        combo.tk.call("event", "generate", listing, "<Return>")
+        self.assertEqual(editor.form_data()["category"], "audio")
+        combo.set("New category")
+        editor.save()
+        self.assertEqual(json.loads(first.read_text())["category"], "New category")
+
+    def test_move_and_rename_categories_from_context_menus(self):
+        ui = self.ui
+        first, second = self.keys
+        local = ui.catalog / "local.json"
+        local.write_text(json.dumps({"id": "local", "local_path": ".", "category": "Tools", "extra": 42}))
+        ui.reload()
+        ui.results[first] = Result("Latest")
+
+        self.right_click_app(first).buttons[MOVE].invoke()
+        dialog = self.root.grab_current()
+        self.assertIsInstance(dialog, CategoryDialog)
+        combo = next(w for w in descendants(dialog) if isinstance(w, ttk.Combobox))
+        self.assertIn("Tools", combo["values"])
+        dialog.value.set("Tools")
+        dialog.save()
+        self.assertEqual(ui.tree.set(first, "Category"), "Tools")
+        self.assertEqual(ui.results[first].status, "Latest")
+
+        listing = ui.category_list
+        self.root.update()
+        x, y, width, height = listing.bbox("category:Tools", "name")
+        listing.event_generate("<Button-3>", x=x + width // 2, y=y + height // 2)
+        self.root.update()
+        self.assertTrue(ui.category_menu.winfo_viewable())
+        ui.category_menu.buttons[RENAME].invoke()
+        dialog = self.root.grab_current()
+        self.assertEqual(dialog.value.get(), "Tools")
+        ui.search.set("alpha")
+        dialog.value.set("Utilities")
+        dialog.save()
+        self.root.update()
+        self.assertEqual(ui.view.get(), "category:Utilities")
+        self.assertEqual(ui.tree.get_children(), (first,))
+        self.assertEqual(listing.set(ui.view.get(), "count"), "2")
+        self.assertEqual(json.loads(local.read_text()), {
+            "id": "local", "local_path": ".", "category": "Utilities", "extra": 42})
+        self.assertNotIn("category", json.loads(Path(second).read_text()))
+
+        self.right_click_app(first).buttons[MOVE].invoke()
+        dialog = self.root.grab_current()
+        dialog.value.set("")
+        dialog.save()
+        self.assertNotIn("category", json.loads(Path(first).read_text()))
+        self.assertEqual(listing.set("category:Utilities", "count"), "1")
+
+    def test_category_rename_detects_stale_members_and_rolls_back_failed_write(self):
+        paths = [Path(key) for key in self.keys]
+        originals = {path: path.read_bytes() for path in paths}
+        members = {path: path.stem for path in paths}
+        with self.assertRaises(ValueError):
+            change_category(self.ui.catalog, {paths[0]: paths[0].stem}, "", "Tools", rename=True)
+
+        replace = Path.replace
+        def fail_second(staged, target):
+            if target == paths[1]:
+                raise PermissionError("File is in use")
+            return replace(staged, target)
+
+        with patch.object(Path, "replace", fail_second), self.assertRaises(PermissionError):
+            change_category(self.ui.catalog, members, "", "Tools", rename=True)
+        self.assertEqual(originals, {path: path.read_bytes() for path in paths})
+
     def test_sidebar_categories_filter_search_and_follow_catalog_changes(self):
         ui = self.ui
         first, second = self.keys
@@ -719,8 +1323,39 @@ class DesktopTest(unittest.TestCase):
         self.assertEqual(listing.set(hardware, "count"), "2")
         self.assertEqual(set(ui.tree.get_children()), set(self.keys))
 
+    def test_sidebar_count_matches_button_through_selection(self):
+        self.ui.results[self.keys[1]] = Result("Pending")
+        self.ui.refresh_view()
+        self.root.deiconify()
+        self.root.update()
+        button = self.ui.nav_buttons["attention"]
+        count = self.ui.nav_counts["attention"]
+
+        def background(widget):
+            return self.ui.style.lookup(widget.cget("style"), "background", widget.state())
+
+        for target in (button, count):
+            self.ui.nav_buttons["all"].invoke()
+            target.event_generate("<Enter>")
+            target.event_generate("<ButtonPress-1>")
+            self.root.update()
+            self.assertTrue(button.instate(["pressed", "!selected"]))
+            self.assertEqual(background(count), background(button))
+            target.event_generate("<ButtonRelease-1>")
+            self.root.update()
+            self.assertTrue(button.instate(["!pressed", "selected"]))
+            self.assertEqual(background(count), background(button))
+            target.event_generate("<Leave>")
+
+        self.ui.nav_buttons["all"].invoke()
+        button.event_generate("<<Invoke>>")
+        self.root.update()
+        self.assertTrue(count.instate(["selected", "!pressed"]))
+        self.assertEqual(background(count), background(button))
+
     def test_sidebar_toggle_reclaims_space_and_restores_labels_and_counts(self):
         self.root.deiconify()
+        self.ui.results[self.keys[1]] = Result("Pending")
         self.ui.search_entry.insert(0, "alpha")
         nav = self.ui.nav_buttons
         nav["updates"].invoke()
@@ -750,9 +1385,9 @@ class DesktopTest(unittest.TestCase):
         self.assertEqual(tree.winfo_width(), tree_width)
         for button in buttons:
             self.assertEqual(str(button.cget("compound")), "left")
-        for badge, placement in placements.items():
-            self.assertTrue(badge.winfo_viewable())
-            self.assertEqual(badge.place_info(), placement)
+        for view, badge in self.ui.nav_counts.items():
+            self.assertEqual(bool(badge.winfo_viewable()), view not in ("progress", "disabled"))
+            self.assertEqual(badge.place_info(), placements[badge])
         self.assertEqual(self.ui.search.get(), "alpha")
         self.assertTrue(nav["attention"].instate(["selected"]))
 
@@ -1084,21 +1719,32 @@ class DesktopTest(unittest.TestCase):
                     "download": f"https://publisher.example/{name}.iso",
                 }))
             self.ui.reload()
-            responses = [GatedDownload() for _ in names]
-            with patch("fetch_sources.open_url", side_effect=responses) as download:
+            responses = {name: GatedDownload() for name in names}
+            def open_download(url):
+                return responses[Path(url).stem]
+
+            self.root.deiconify()
+            with patch("fetch_sources.open_url", side_effect=open_download) as download:
                 self.ui.all_buttons["fetch"].invoke()
                 try:
-                    for index, (name, response) in enumerate(zip(names, responses), start=1):
-                        self.wait_for(lambda: response.waiting.is_set() and self.ui.downloading
-                                      and self.ui.working_key == str(self.ui.catalog / f"{name}.json"))
-                        self.assertIn(f"{index} of 4 downloads", self.ui.status.get())
-                        response.resume.set()
+                    self.ui.nav_buttons["progress"].invoke()
+                    self.wait_for(lambda: all(responses[name].waiting.is_set() for name in names[:3])
+                                  and all(bar.winfo_ismapped() for bar in self.ui.row_bars))
+                    self.assertEqual(download.call_count, 3)
+                    self.assertEqual({Path(key).stem for key in self.ui.tree.get_children()}, set(names[:3]))
+                    self.assertIn("1 of 4 downloads", self.ui.status.get())
+                    responses["delta"].resume.set()
+                    self.wait_for(lambda: responses["gamma"].waiting.is_set() and
+                                  {Path(key).stem for key in self.ui.transfers} == {"amber", "epsilon", "gamma"})
+                    responses["amber"].resume.set()
+                    responses["epsilon"].resume.set()
+                    self.wait_for(lambda: "4 of 4 downloads" in self.ui.status.get())
                 finally:
-                    for response in responses:
+                    for response in responses.values():
                         response.resume.set()
                     self.wait_until_idle()
-            self.assertEqual([call.args[0] for call in download.call_args_list],
-                             [f"https://publisher.example/{name}.iso" for name in names])
+            self.assertCountEqual([call.args[0] for call in download.call_args_list],
+                                  [f"https://publisher.example/{name}.iso" for name in names])
             self.assertEqual([self.ui.results[key].status for key in self.keys], ["Latest", "Cached"])
 
     def test_update_all_excludes_matching_local_windows_iso_from_downloads(self):
@@ -1123,8 +1769,8 @@ class DesktopTest(unittest.TestCase):
         ):
             self.ui.all_buttons["fetch"].invoke()
             try:
-                self.wait_for(lambda: response.waiting.is_set() and self.ui.downloading)
-                self.assertEqual(self.ui.working_key, self.keys[1])
+                self.wait_for(lambda: response.waiting.is_set() and self.ui.transfers)
+                self.assertEqual(set(self.ui.transfers), {self.keys[1]})
                 self.assertTrue(self.ui.status.get().endswith("1 of 1 download"), self.ui.status.get())
             finally:
                 response.resume.set()
@@ -1141,7 +1787,7 @@ class DesktopTest(unittest.TestCase):
         self.root.update()
         gc.collect()
         progress_widgets = (self.ui.download_progress, editor.download_progress)
-        row_bar, tree, key = self.ui.row_progress, self.ui.tree, self.keys[0]
+        row_bar, tree, key = self.ui.row_bars[0], self.ui.tree, self.keys[0]
 
         def bar_in_status_cell():
             cell = tree.bbox(key, "Status")
@@ -1238,7 +1884,7 @@ class DesktopTest(unittest.TestCase):
                 for progress in progress_widgets:
                     self.assertEqual(str(progress.bar["mode"]), "indeterminate")
                     self.assertEqual(progress.percent.cget("text"), "")
-                row_bar = self.ui.row_progress
+                row_bar = self.ui.row_bars[0]
                 self.wait_for(row_bar.winfo_ismapped)
                 self.assertEqual(str(row_bar["mode"]), "indeterminate")
                 bars = [*(progress.bar for progress in progress_widgets), row_bar]
@@ -1316,7 +1962,7 @@ class DesktopTest(unittest.TestCase):
                     original_size = button.winfo_width(), button.winfo_height()
                     button.invoke()
                     try:
-                        self.wait_for(publisher.entered.is_set)
+                        self.wait_for(lambda: page.call_count == 2)
                         self.root.update_idletasks()
                         self.assertEqual(button.cget("text"), "Cancel")
                         self.assertEqual((button.winfo_width(), button.winfo_height()), original_size)
@@ -1326,12 +1972,13 @@ class DesktopTest(unittest.TestCase):
                     finally:
                         publisher.resume.set()
                         self.wait_until_idle()
-                    self.assertEqual(page.call_count, 1)
+                    self.assertEqual(page.call_count, 2)
                     download.assert_not_called()
                 self.assertEqual(self.ui.results, previous)
                 self.assertEqual(button.cget("text"), label)
                 self.assertEqual((button.winfo_width(), button.winfo_height()), original_size)
-                self.assertTrue(all(b.instate(["!disabled"]) for b in self.ui.all_buttons.values()))
+                self.assertTrue(all(b.instate(["!disabled"]) for b in self.ui.all_buttons.values()
+                                    if b.winfo_ismapped()))
                 self.assertIn("0 of 2 processed, 2 canceled", self.ui.status.get())
                 self.assertEqual(self.ui.view_counts["progress"].get(), "0")
 
@@ -1361,7 +2008,7 @@ class DesktopTest(unittest.TestCase):
         with patch("releaseshelf.verify", side_effect=gated_verify) as worker:
             verify.invoke()
             try:
-                self.wait_for(lambda: self.ui.working_key == self.keys[0] and worker.called)
+                self.wait_for(lambda: self.keys[0] in self.ui.active_items and worker.called)
                 self.assertFalse(menu.winfo_viewable())
                 self.assertTrue(trigger.instate(["!disabled"]))
                 trigger.invoke()
@@ -1399,12 +2046,13 @@ class DesktopTest(unittest.TestCase):
             blocked = GatedDownload()
             second = io.BytesIO(b"second")
             second.headers = {}
-            with patch("fetch_sources.open_url", side_effect=(blocked, second)):
+            with patch("fetch_sources.open_url", side_effect=lambda url: blocked if url.endswith("alpha.bin") else second):
                 self.ui.all_buttons["fetch"].invoke()
                 try:
-                    self.wait_for(lambda: blocked.waiting.is_set() and self.ui.downloading)
+                    self.wait_for(lambda: blocked.waiting.is_set() and self.ui.transfers)
                     self.ui.tree.selection_set(beta)
-                    button = self.right_click_app(alpha).buttons["Cancel"]
+                    menu = self.right_click_app(alpha, cancel_for="Get updates")
+                    button = menu.buttons["Get updates"]
                     self.assertTrue(button.instate(["!disabled"]))
                     button.invoke()
                     self.wait_until_idle()
@@ -1422,7 +2070,11 @@ class DesktopTest(unittest.TestCase):
         self.assertIn("1 of 2 processed, 1 canceled", self.ui.status.get())
 
     def test_right_click_cancels_queued_app_and_single_check(self):
-        alpha, beta = self.keys
+        alpha = self.keys[0]
+        for name in ("delta", "gamma"):
+            (self.ui.catalog / f"{name}.json").write_text(Path(alpha).read_text().replace("alpha", name))
+        self.ui.reload()
+        queued = str(self.ui.catalog / "gamma.json")
         for bulk in (True, False):
             with self.subTest(bulk=bulk):
                 publisher = GatedPage()
@@ -1431,27 +2083,77 @@ class DesktopTest(unittest.TestCase):
                     if bulk:
                         self.ui.all_buttons["check"].invoke()
                     else:
-                        self.right_click_app(beta).buttons["Check for updates"].invoke()
+                        self.right_click_app(queued).buttons["Check for updates"].invoke()
                     try:
-                        self.wait_for(publisher.entered.is_set)
+                        expected_calls = 3 if bulk else 1
+                        self.wait_for(lambda: page.call_count == expected_calls
+                                      and len(self.ui.active_items) == expected_calls)
+                        if bulk:
+                            self.assertNotIn(queued, self.ui.active_items)
                         if not bulk:
                             menu = self.right_click_app(alpha)
-                            self.assertTrue(menu.buttons["Cancel"].instate(["disabled"]))
+                            self.assertTrue(all(button.instate(["disabled"]) for button in menu.buttons.values()))
                             menu.dismiss()
-                        button = self.right_click_app(beta).buttons["Cancel"]
+                        menu = self.right_click_app(queued, cancel_for="Check for updates")
+                        button = menu.buttons["Check for updates"]
                         self.assertTrue(button.instate(["!disabled"]))
                         button.invoke()
                     finally:
                         publisher.resume.set()
                         self.wait_until_idle()
-                    self.assertEqual(page.call_count, 1)
+                    self.assertEqual(page.call_count, expected_calls)
                 if bulk:
                     self.assertEqual(self.ui.results[alpha].status, "Update available")
                 else:
                     self.assertEqual(self.ui.results[alpha], previous[alpha])
-                self.assertEqual(self.ui.results[beta], previous[beta])
-                expected = "1 of 2 processed" if bulk else "0 of 1 processed"
+                self.assertEqual(self.ui.results[queued], previous[queued])
+                expected = "3 of 4 processed" if bulk else "0 of 1 processed"
                 self.assertIn(f"{expected}, 1 canceled", self.ui.status.get())
+
+    def test_right_click_cancel_replaces_the_requested_action_and_restores_its_slot(self):
+        key = self.keys[0]
+        self.ui.change_language("fr")
+        for label, worker in (("Get updates", "shelf_window.prepare_fetch"),
+                              ("Verify files", "shelf_window.execute")):
+            with self.subTest(action=label):
+                entered, resume = Event(), Event()
+
+                def run(*args, cancel_event, **kwargs):
+                    entered.set()
+                    if not resume.wait(10):
+                        raise TimeoutError("The test did not release the worker")
+                    return Result("Canceled" if cancel_event.is_set() else "Verified")
+
+                menu = self.right_click_app(key)
+                button = menu.buttons[label]
+                original_geometry = button.winfo_geometry()
+                original_icon = menu.icon_names[button]
+                previous = self.ui.results[key]
+                with patch(worker, side_effect=run) as operation:
+                    button.invoke()
+                    try:
+                        self.wait_for(lambda: entered.is_set() and key in self.ui.active_items)
+                        # An update begins by checking the publisher, but Get updates owns its cancel action.
+                        if label == "Get updates":
+                            self.assertEqual(self.ui.active_items[key][0], "check")
+                        menu = self.right_click_app(key, cancel_for=label)
+                        self.assertEqual(menu.icon_names[button], "cancel")
+                        self.assertEqual(button.winfo_geometry(), original_geometry)
+                        self.assertTrue(button.instate(["!disabled"]))
+                        button.invoke()
+                    finally:
+                        resume.set()
+                        self.wait_until_idle()
+                    operation.assert_called_once()
+                self.assertEqual(self.ui.results[key], previous)
+                summary = tr("{label}  ·  {finished} of {total} processed, {canceled} canceled",
+                             label=tr(label), finished=0, total=1, canceled=1)
+                self.assertEqual(self.ui.status.get(), summary)
+                menu = self.right_click_app(key)
+                self.assertEqual(menu.icon_names[button], original_icon)
+                self.assertEqual(button.winfo_geometry(), original_geometry)
+                self.assertTrue(button.instate(["!disabled"]))
+                menu.dismiss()
 
     def test_search_by_display_name_and_id_keeps_catalog_wide_check(self):
         editor = self.edit_selected()
@@ -1479,20 +2181,26 @@ class DesktopTest(unittest.TestCase):
 
     def test_updates_view_tracks_results_and_attention_includes_recipe_errors(self):
         valid, invalid = self.keys
+        nav = self.ui.nav_buttons
+        self.assertEqual([view for view, button in nav.items() if button.winfo_manager()],
+                         ["checklist", "all", "local"])
+        nav["checklist"].invoke()
+        self.assertEqual(self.ui.empty_title.get(), "No checklists yet")
         Path(invalid).write_text("{")
         self.ui.more_menu.buttons["Reload catalog"].invoke()
-        self.ui.nav_buttons["updates"].invoke()
-        self.root.update()
+        self.assertEqual(nav["attention"].winfo_manager(), "grid")
         tree = self.ui.tree
-        self.assertEqual(tree.get_children(), ())
         with patch("fetch_sources.read_page", return_value="1"):
             self.click(self.ui.all_buttons["check"])
+            self.assertEqual(nav["updates"].winfo_manager(), "grid")
+            nav["updates"].invoke()
             self.assertEqual(tree.get_children(), (valid,))
             reply = io.BytesIO(b"fixture")
             reply.headers = {}
             with patch("fetch_sources.open_url", return_value=reply):
                 self.click(self.ui.all_buttons["fetch"])
         self.assertEqual(tree.get_children(), ())
+        self.assertFalse(nav["updates"].winfo_manager())
         self.assertEqual(self.ui.view_counts["updates"].get(), "0")
         self.ui.nav_buttons["attention"].invoke()
         self.root.update()
@@ -1501,6 +2209,32 @@ class DesktopTest(unittest.TestCase):
         self.ui.nav_buttons["all"].invoke()
         self.root.update()
         self.assertEqual(set(tree.get_children()), set(self.keys))
+
+    def test_reset_search_reveals_counted_item_in_needs_attention(self):
+        ui = self.ui
+        invalid = self.keys[1]
+        Path(invalid).write_text("{")
+        ui.reload()
+        ui.search.set("alpha")
+        ui.nav_buttons["attention"].invoke()
+        self.root.deiconify()
+        self.root.update()
+        self.assertEqual(ui.view_counts["attention"].get(), "1")
+        self.assertEqual(ui.tree.get_children(), ())
+        self.assertEqual(ui.empty_title.get(), "No matching items")
+        self.assertTrue(ui.reset_search_button.winfo_viewable())
+
+        ui.reset_search_button.invoke()
+        self.root.update()
+        self.assertEqual(ui.search.get(), "")
+        self.assertEqual(ui.view.get(), "attention")
+        self.assertEqual(ui.tree.get_children(), (invalid,))
+        self.assertFalse(ui.reset_search_button.winfo_viewable())
+
+        ui.nav_buttons["progress"].invoke()
+        self.root.update()
+        self.assertTrue(ui.empty_panel.winfo_viewable())
+        self.assertFalse(ui.reset_search_button.winfo_viewable())
 
     def test_pending_publication_appears_in_both_actionable_views(self):
         root = self.dest / "alpha"
@@ -1528,19 +2262,20 @@ class DesktopTest(unittest.TestCase):
                 raise TimeoutError("The progress view test did not release the worker")
             return Result("Verified")
 
-        self.ui.nav_buttons["progress"].invoke()
-        self.assertEqual(self.ui.tree.get_children(), ())
+        progress = self.ui.nav_buttons["progress"]
+        self.assertFalse(progress.winfo_manager())
         self.assertEqual(self.ui.view_counts["progress"].get(), "0")
-        self.assertEqual(self.ui.empty_title.get(), "No operations in progress")
         with patch("shelf_window.execute", side_effect=execute):
             self.ui.more_menu.buttons["Verify all items"].invoke()
             try:
-                self.wait_for(lambda: self.ui.working_key == self.keys[0]
+                self.wait_for(lambda: self.keys[0] in self.ui.active_items
                               and self.ui.view_counts["progress"].get() == "1")
+                self.assertEqual(progress.winfo_manager(), "grid")
+                progress.invoke()
                 self.assertEqual(self.ui.tree.get_children(), (self.keys[0],))
                 self.assertEqual(self.ui.tree.set(self.keys[0], "Status"), "Verifying…")
                 resume["alpha"].set()
-                self.wait_for(lambda: self.ui.working_key == self.keys[1])
+                self.wait_for(lambda: self.keys[1] in self.ui.active_items)
                 self.assertEqual(self.ui.tree.get_children(), (self.keys[1],))
                 self.assertEqual(self.ui.view_counts["progress"].get(), "1")
                 self.assertEqual(self.ui.tree.set(self.keys[1], "Status"), "Verifying…")
@@ -1550,6 +2285,7 @@ class DesktopTest(unittest.TestCase):
                     event.set()
                 self.wait_until_idle()
         self.assertEqual(self.ui.view.get(), "progress")
+        self.assertFalse(progress.winfo_manager())
         self.assertEqual(self.ui.tree.get_children(), ())
         self.assertEqual(self.ui.view_counts["progress"].get(), "0")
         self.assertEqual(self.ui.empty_title.get(), "No operations in progress")
@@ -1567,7 +2303,7 @@ class DesktopTest(unittest.TestCase):
         with patch("shelf_window.execute", side_effect=execute):
             self.ui.start("check", key=self.keys[0])
             try:
-                self.wait_for(lambda: self.ui.working_key == self.keys[0]
+                self.wait_for(lambda: self.keys[0] in self.ui.active_items
                               and self.ui.view_counts["progress"].get() == "1")
                 self.assertEqual(self.ui.search.get(), "beta")
                 self.assertEqual(self.ui.tree.get_children(), ())
@@ -1596,9 +2332,8 @@ class DesktopTest(unittest.TestCase):
         with patch("shelf_window.execute", side_effect=execute):
             self.ui.all_buttons["check"].invoke()
             try:
-                self.wait_for(lambda: self.ui.working_key == self.keys[0]
-                              and self.ui.view_counts["progress"].get() == "1")
-                self.assertEqual(self.ui.tree.get_children(), (self.keys[0],))
+                self.wait_for(lambda: self.ui.view_counts["progress"].get() == "2")
+                self.assertCountEqual(self.ui.tree.get_children(), self.keys)
             finally:
                 resume.set()
                 self.wait_until_idle()
@@ -1943,7 +2678,9 @@ class DesktopTest(unittest.TestCase):
     def test_iso_source_settings_round_trip_and_switch_to_direct_download(self):
         path = Path(self.keys[0])
         editor = self.edit_selected()
+        self.assertFalse(editor.windows_iso_button.winfo_manager())
         editor.fields["page"].set("https://www.microsoft.com/en-us/software-download/windows11")
+        self.assertEqual(editor.windows_iso_button.winfo_manager(), "grid")
         editor.fields["version_pattern"].set(r"Version (\d{2}H[12])")
         pattern = r"English x64 ([0-9A-Fa-f]{64})"
         editor.fields["sha256_pattern"].set(pattern)
@@ -1960,6 +2697,10 @@ class DesktopTest(unittest.TestCase):
         self.assertTrue(editor.download_entry.instate(["disabled"]))
         self.assertEqual(editor.form_data(), saved)
         editor.windows_iso_button.invoke()
+        self.assertTrue(editor.download_entry.instate(["!disabled"]))
+        editor.windows_iso_button.invoke()
+        editor.fields["page"].set("https://example.org/releases")
+        self.assertFalse(editor.windows_iso_button.winfo_manager())
         self.assertTrue(editor.download_entry.instate(["!disabled"]))
         download = "https://example.org/system-{version}.iso"
         editor.fields["download"].set(download)

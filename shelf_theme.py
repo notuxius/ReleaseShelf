@@ -6,6 +6,10 @@ from dataclasses import dataclass
 import os
 from pathlib import Path
 import tempfile
+from tkinter import ttk
+
+from shelf_checkboxes import style_checkboxes
+from shelf_text import TREE_TEXT_PAD
 
 THEME_MODES = ("System", "Light", "Dark")
 WINDOW_SIDE_PADDING = 22
@@ -181,14 +185,16 @@ def initial_geometry(window, width, height, *, parent=None):
 def style_heading_dividers(style, color):
     element = "ReleaseShelf.headingDivider"
     bottom = "ReleaseShelf.headingBottom"
-    line = "ReleaseShelfHeadingLine"
+    right_line = "ReleaseShelfHeadingRightLine"
+    bottom_line = "ReleaseShelfHeadingBottomLine"
     if element not in style.element_names():
-        # Named images share the theme's lifetime across catalog windows.
         blank = "ReleaseShelfHeadingBlank"
-        for image in (blank, line):
-            style.tk.call("image", "create", "photo", image, "-width", 1, "-height", 1)
-        style.element_create(element, "image", blank, ("alternate", line))
-        style.element_create(bottom, "image", line)
+        # ttk tiles image elements. Paint typical heading edges in one blit
+        # while keeping their requested thickness and minimum length at 1 px.
+        for image, width, height in ((blank, 1, 64), (right_line, 1, 64), (bottom_line, 256, 1)):
+            style.tk.call("image", "create", "photo", image, "-width", width, "-height", height)
+        style.element_create(element, "image", blank, ("alternate", right_line), height=1)
+        style.element_create(bottom, "image", bottom_line, width=1)
         # Each heading has either a caption or an icon. Center both in the same space.
         style.layout("Treeview.Heading", [
             ("Treeheading.cell", {"sticky": "nsew"}),
@@ -198,7 +204,8 @@ def style_heading_dividers(style, color):
                     ("Treeheading.image", {"sticky": ""})]})]}),
             (element, {"sticky": "nse"}),
             (bottom, {"sticky": "sew"})])
-    style.tk.call(line, "put", color)
+    style.tk.call(right_line, "put", color, "-to", 0, 0, 1, 64)
+    style.tk.call(bottom_line, "put", color, "-to", 0, 0, 256, 1)
 
 
 def style_dropdown_arrows(style, color):
@@ -209,6 +216,12 @@ def style_dropdown_arrows(style, color):
         for image in (down, up):
             style.tk.call("image", "create", "photo", image, "-width", 31, "-height", 6)
         style.element_create(indicator, "image", down, ("selected", up))
+        combo_arrow = "ReleaseShelf.comboArrow"
+        style.element_create(combo_arrow, "image", down, ("pressed", up))
+        style.layout("TCombobox", [("Combobox.field", {"sticky": "nswe", "children": [
+            (combo_arrow, {"side": "right", "sticky": ""}),
+            ("Combobox.padding", {"sticky": "nswe", "children": [
+                ("Combobox.textarea", {"sticky": "nswe"})]})]})])
         style.layout("TMenubutton", [("Menubutton.border", {"sticky": "nswe", "children": [
             ("Menubutton.focus", {"sticky": "nswe", "children": [
                 (indicator, {"side": "right", "sticky": ""}),
@@ -219,23 +232,43 @@ def style_dropdown_arrows(style, color):
             style.tk.call(image, "put", color, "-to", 8 + row, y, 19 - row, y + 1)
 
 
+def category_picker(parent, variable, choices, *, width):
+    field = ttk.Combobox(parent, textvariable=variable, values=choices, width=width, height=10,
+                         font=("Segoe UI", 10))
+    style = ttk.Style(parent)
+
+    def style_popup():
+        # Tk builds the popup with a classic listbox outside the ttk style system.
+        popup = field.tk.call("ttk::combobox::PopdownWindow", field)
+        field.tk.call(f"{popup}.f.l", "configure", "-font", field.cget("font"),
+                      "-background", style.lookup("TCombobox", "fieldbackground"),
+                      "-foreground", style.lookup("TCombobox", "foreground"),
+                      "-selectbackground", style.lookup("TCombobox", "selectbackground", ("focus",)),
+                      "-selectforeground", style.lookup("TCombobox", "selectforeground", ("focus",)),
+                      "-borderwidth", 5, "-relief", "flat", "-selectborderwidth", 0)
+
+    field.configure(postcommand=style_popup)
+    return field
+
+
 def style_editor_tabs(style, palette):
     tab = "Editor.TNotebook.Tab"
     face = "ReleaseShelf.editorTab"
     normal, hover, selected = "ReleaseShelfTabNormal", "ReleaseShelfTabHover", "ReleaseShelfTabSelected"
     if face not in style.element_names():
-        # Stretch the face with the caption but keep the three-pixel underline at the bottom.
+        # Tk tiles the image for every repaint. Cover a typical tab in one or
+        # two blits while letting the caption determine the actual tab size.
         for image in (normal, hover, selected):
-            style.tk.call("image", "create", "photo", image, "-width", 1, "-height", 4)
+            style.tk.call("image", "create", "photo", image, "-width", 128, "-height", 48)
         style.element_create(face, "image", normal, ("selected", selected), ("active", hover),
-                             border=(0, 0, 0, 3), padding=(0, 0, 0, 3), sticky="nsew")
+                             width=1, height=4, border=(0, 0, 0, 3), padding=(0, 0, 0, 3), sticky="nsew")
         style.layout(tab, [(face, {"sticky": "nsew", "children": [
             ("Notebook.padding", {"sticky": "nsew", "children": [
                 ("Notebook.focus", {"sticky": "nsew", "children": [
                     ("Notebook.label", {"sticky": ""})]})]})]})])
     for image, fill in ((normal, palette.canvas), (hover, palette.subtle), (selected, palette.selection)):
-        style.tk.call(image, "put", fill, "-to", 0, 0, 1, 4)
-    style.tk.call(selected, "put", palette.tab_indicator or palette.accent, "-to", 0, 1, 1, 4)
+        style.tk.call(image, "put", fill, "-to", 0, 0, 128, 48)
+    style.tk.call(selected, "put", palette.tab_indicator or palette.accent, "-to", 0, 45, 128, 48)
     style.configure("Editor.TNotebook", tabmargins=0, background=palette.canvas, bordercolor=palette.line,
                     lightcolor=palette.canvas, darkcolor=palette.canvas)
     padding = (15, 8)
@@ -264,6 +297,12 @@ def style_widgets(s, p):
     s.configure("EditorError.TLabel", foreground="#f5afa6" if p.is_dark else "#a12d26")
     s.configure("TEntry", fieldbackground=p.surface, foreground=p.text, insertcolor=p.text,
                 selectbackground=p.selection, selectforeground=p.text, padding=5)
+    s.configure("TCombobox", fieldbackground=p.surface, foreground=p.text, insertcolor=p.text,
+                selectbackground=p.selection, selectforeground=p.text, bordercolor=p.line,
+                lightcolor=p.surface, darkcolor=p.surface, padding=(8, 6))
+    s.map("TCombobox", bordercolor=[("pressed", p.accent), ("focus", p.accent), ("active", p.accent)])
+    s.configure("ComboboxPopdownFrame", bordercolor=p.line, lightcolor=p.line, darkcolor=p.line,
+                background=p.surface, relief="solid", borderwidth=1)
     # Blend clam's bevel and inner focus ring into the fill. Only the outer
     # border changes color on hover or keyboard focus for every dropdown.
     s.configure("TMenubutton", padding=(10, 7), background=p.surface, borderwidth=1,
@@ -327,15 +366,12 @@ def style_widgets(s, p):
                 background=p.surface, foreground=p.text)
     s.map("AppMenu.TButton", background=[("disabled", p.surface), ("focus", p.selection)],
           foreground=[("disabled", p.muted)])
-    s.configure("AppMenu.TCheckbutton", padding=(10, 6, 16, 6), background=p.surface,
-                foreground=p.text, indicatorbackground=p.surface, indicatorforeground=p.on_accent,
-                upperbordercolor=p.muted, lowerbordercolor=p.muted, focuscolor=p.selection)
+    style_checkboxes(s, p)
+    s.configure("AppMenu.TCheckbutton", padding=(7, 6, 16, 6), background=p.surface,
+                foreground=p.text, focuscolor=p.selection)
     s.map("AppMenu.TCheckbutton", background=[("focus", p.selection), ("active", p.selection)],
-          foreground=[("disabled", p.muted)], indicatorbackground=[("selected", p.accent)])
-    s.configure("Options.TCheckbutton", padding=(0, 3), indicatorbackground=p.surface,
-                indicatorforeground=p.on_accent, upperbordercolor=p.muted, lowerbordercolor=p.muted)
-    s.map("Options.TCheckbutton", background=[("active", p.canvas)],
-          indicatorbackground=[("selected", p.accent), ("!selected", p.surface)])
+          foreground=[("disabled", p.muted)])
+    s.configure("Options.TCheckbutton", padding=(0, 3))
     s.layout("Nav.TButton", flat_button)
     # Reserve space for the overlaid count while allowing translated labels to grow.
     s.configure("Nav.TButton", background=p.subtle, anchor="w", width=-1, space=9, padding=(12, 9, 38, 9))
@@ -356,13 +392,13 @@ def style_widgets(s, p):
     s.layout("Treeview", [("Treeview.treearea", {"sticky": "nsew"})])
     s.configure("Treeview", rowheight=42, background=p.surface, foreground=p.text)
     s.configure("Categories.Treeview", rowheight=32, background=p.subtle, fieldbackground=p.subtle)
-    s.configure("Treeview.Cell", padding=(10, 0))
-    # The catalog is flat. Its optional tree column contains only the app icon.
+    s.configure("Treeview.Cell", padding=(TREE_TEXT_PAD, 0))
+    # Center app icons and checklist boxes in the leading column of these flat tables.
     s.layout("Treeview.Item", [("Treeitem.image", {"sticky": ""})])
     s.map("Treeview", background=[("selected", p.selection)], foreground=[("selected", p.text)])
     style_heading_dividers(s, p.line)
     s.configure("Treeview.Heading", font=("Segoe UI Semibold", 9), background=p.canvas,
-                foreground=p.muted, padding=(10, 8), relief="flat", borderwidth=0)
+                foreground=p.muted, padding=(TREE_TEXT_PAD, 8), relief="flat", borderwidth=0)
     s.map("Treeview.Heading", background=[("active", p.subtle)])
     s.configure("TScrollbar", background=p.subtle, troughcolor=p.surface, arrowcolor=p.muted,
                 arrowsize=11, borderwidth=0, lightcolor=p.subtle, darkcolor=p.subtle)

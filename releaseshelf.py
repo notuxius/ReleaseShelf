@@ -6,6 +6,7 @@ import re
 import sys
 import zipfile
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from dataclasses import dataclass
 from http.client import HTTPException
@@ -14,6 +15,7 @@ from pathlib import Path
 from fetch_sources import Recipe, Release, filename
 from fetch_store import Result, fetch_lock, matches, read_state, run_release, verify
 from shelf_cancel import JobCanceled, cancel_scope, check_canceled, publisher_items
+from shelf_checklist import Checklist, LocalItem, catalog_item
 from shelf_message import error_detail, message
 
 
@@ -21,6 +23,19 @@ ERRORS = (OSError, ValueError, LookupError, TypeError, AttributeError, re.error,
           zipfile.BadZipFile, HTTPException, RuntimeError)
 APP_DIR = Path(sys.executable if getattr(sys, "frozen", False) else __file__).resolve().parent
 DEFAULT_CATALOG = APP_DIR / "recipes"
+MAX_PARALLEL_ITEMS = 3
+
+
+def batch_map(action, worker, items):
+    if action == "verify":
+        yield from map(worker, items)
+    else:
+        with ThreadPoolExecutor(max_workers=MAX_PARALLEL_ITEMS) as pool:
+            yield from pool.map(worker, items)
+
+
+def updates_disabled(job):
+    return isinstance(job, Recipe) and job.updates_disabled
 
 
 def default_destination():
@@ -85,7 +100,7 @@ def run_job(action, recipe, dest, target, on_progress=None, *, prepared=None, de
 
 
 def exit_code(action, result, batch):
-    if result.status in {"Source error", "Error"} or (action == "verify" and result.status != "Verified"):
+    if result.status in {"Source error", "Error"} or (action == "verify" and result.status not in {"Verified", "Local only"}):
         return 1
     if result.status == "Pending" or (batch and result.status in {"Repair needed", "Update available"}):
         return 2
@@ -111,9 +126,16 @@ def main(argv=None):
     codes = []
     if args.all:
         print("Recipe\tLocal\tAvailable\tResult\tDetails")
-    for path, job in jobs:
+        jobs = [(path, job) for path, job in jobs if not isinstance(job, (Checklist, LocalItem))
+                and (args.action == "verify" or not updates_disabled(job))]
+
+    def process(item):
+        path, job = item
+        return path, job, execute(args.action, job, dest, targets)
+
+    results = batch_map(args.action, process, jobs) if args.all else map(process, jobs)
+    for path, job, result in results:
         name = path.name if isinstance(job, Result) else job.id
-        result = execute(args.action, job, dest, targets)
         if args.all:
             detail = " | ".join(result.detail.splitlines())
             print(f"{name}\t{result.local}\t{result.available}\t{result.status}\t{detail}")
@@ -122,25 +144,33 @@ def main(argv=None):
             label = "Source Error" if result.status == "Source error" else result.status
             print(f"{label}: {version}\n{result.detail}")
         codes.append(exit_code(args.action, result, args.all))
-    return 1 if 1 in codes else max(codes)
+    return 1 if 1 in codes else max(codes, default=0)
+
+
+class ChecklistLoadError(Result):
+    """An invalid entry whose JSON still identifies it as a checklist."""
 
 
 def read_jobs(paths):
     jobs = []
     for path in paths:
+        data = None
         try:
-            jobs.append((path, Recipe.read(path)))
+            data = json.loads(path.read_text(encoding="utf-8-sig"))
+            jobs.append((path, catalog_item(data, path=path)))
         except ERRORS as exc:
-            jobs.append((path, Result("Error", detail=error_detail(exc))))
-    counts = Counter(key for _, recipe in jobs if isinstance(recipe, Recipe) for key in recipe.id_keys())
+            kind = ChecklistLoadError if isinstance(data, dict) and data.get("type") == "checklist" else Result
+            jobs.append((path, kind("Error", detail=error_detail(exc))))
+    counts = Counter(key for _, recipe in jobs if not isinstance(recipe, Result) for key in recipe.id_keys())
     shortcuts = Counter(recipe.shortcut.casefold() for _, recipe in jobs if isinstance(recipe, Recipe) and recipe.shortcut)
     for index, (path, recipe) in enumerate(jobs):
-        if isinstance(recipe, Recipe):
+        if not isinstance(recipe, Result):
             duplicates = [key for key in recipe.id_keys() if counts[key] > 1]
             if duplicates:
                 detail = message("Duplicate recipe ID {ids} in {path}", ids=", ".join(duplicates), path=path)
-                jobs[index] = (path, Result("Error", detail=detail))
-            elif recipe.shortcut and shortcuts[recipe.shortcut.casefold()] > 1:
+                kind = ChecklistLoadError if isinstance(recipe, Checklist) else Result
+                jobs[index] = (path, kind("Error", detail=detail))
+            elif isinstance(recipe, Recipe) and recipe.shortcut and shortcuts[recipe.shortcut.casefold()] > 1:
                 jobs[index] = (path, Result("Error", detail=f"Duplicate Start menu shortcut: {recipe.shortcut}"))
     return jobs
 
@@ -181,6 +211,12 @@ def execute(action, job, dest, targets, on_progress=None, cancel_event=None, *, 
         with cancel_scope(cancel_event):
             if isinstance(job, Result):
                 return job
+            if isinstance(job, Checklist):
+                return Result("Error", detail="Open the setup checklist in ReleaseShelf to choose adjustments.")
+            if isinstance(job, LocalItem):
+                return local_result(job)
+            if action in ("check", "fetch") and job.updates_disabled:
+                return Result("Disabled")
             keys = [key for key in job.id_keys() if key in targets]
             if len(keys) > 1:
                 raise ValueError(message("Multiple target mappings for {app}: {keys}. "
@@ -192,6 +228,12 @@ def execute(action, job, dest, targets, on_progress=None, cancel_event=None, *, 
         return Result("Canceled")
     except ERRORS as exc:
         return Result("Error", detail=error_detail(exc))
+
+
+def local_result(job):
+    if job.path.exists():
+        return Result("Local only", detail=str(job.path))
+    return Result("Error", detail=message("Missing file: {path}", path=job.path))
 
 
 def run_cli():

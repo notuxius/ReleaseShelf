@@ -80,7 +80,43 @@ class ReleaseShelfTest(unittest.TestCase):
         data = (self.publisher / path.lstrip("/")).read_bytes()
         headers = Message()
         headers["Content-Length"] = str(len(data))
+        headers["Last-Modified"] = "Tue, 10 Nov 2026 16:20:57 GMT"
         return addinfourl(io.BytesIO(data), headers, request.full_url, 200)
+
+    def test_local_catalog_item_is_offline_and_skipped_in_batches(self):
+        folder = self.recipe_file.parent / "catalog"
+        folder.mkdir()
+        self.recipe_file = folder / "local.json"
+        self.recipe_file.write_text(json.dumps({"id": "portable", "local_path": "../publisher"}))
+        for action in ("check", "fetch", "verify"):
+            self.assertIn("Local only", self.cli(action))
+            self.assertNotIn("portable", self.cli(action, batch=folder))
+        self.assertEqual(self.requests, [])
+        self.assertFalse(self.dest.exists())
+
+    def test_disabled_recipe_skips_publisher_and_allows_verification(self):
+        self.recipe_file.write_text(json.dumps({**self.recipe, "updates_disabled": True}))
+        for action in ("check", "fetch"):
+            self.assertIn("Disabled", self.cli(action))
+            self.assertNotIn(self.recipe["id"], self.cli(action, batch=self.recipe_file.parent))
+        self.assertIn(self.recipe["id"], self.cli("verify", batch=self.recipe_file.parent, expected_code=1))
+        self.assertEqual(self.requests, [])
+        self.assertFalse(self.dest.exists())
+
+    def test_direct_download_uses_remote_modification_time(self):
+        url = self.recipe["download"]
+        job = Recipe.from_data({"id": "fixed", "direct_download": url})
+        with patch("urllib.request.OpenerDirector.open", side_effect=self.reply) as request:
+            release = job.resolve()
+        self.assertEqual(request.call_args.args[0].get_method(), "HEAD")
+        self.assertEqual((release.version, release.download), ("2026-11-10 16:20:57 UTC", url))
+
+    def test_version_and_build_tokens_come_from_same_page_match(self):
+        data = {**self.recipe, "version_pattern": r"v([0-9.]+) build (?P<asset>\d+)",
+                "download": "https://publisher.example/{version}/setup-{asset}.exe"}
+        with patch("fetch_sources.read_page", return_value="v1.27 build 41"):
+            result = Recipe.from_data(data).resolve()
+        self.assertEqual(result.download, "https://publisher.example/1.27/setup-41.exe")
 
     def cli(self, action, *, success=True, batch=None, expected_code=None):
         selection = ["--all", "--catalog", str(batch)] if batch else [str(self.recipe_file)]
@@ -143,10 +179,87 @@ class ReleaseShelfTest(unittest.TestCase):
             self.assertFalse((live / "old.txt").exists())
             self.assertEqual((live / "settings/default.ini").read_bytes(), b"second")
             self.assertEqual((live / "user.log").read_bytes(), b"keep")
+            self.assertFalse((self.job / ".previous-app").exists())
             package("1.2", {"tool.exe": b"changed", "../outside": b"invalid"})
             self.assertEqual(run("fetch").status, "Error")
             self.assertEqual((live / "tool.exe").read_bytes(), b"exe")
             self.assertEqual(run("verify").status, "Verified")
+
+    def test_companions_survive_updates_and_restore_from_a_moved_catalog(self):
+        self.recipe.update(extract=["SampleTool.exe", "help.txt"])
+        self.recipe_file.write_text(json.dumps(self.recipe))
+        self.cli("fetch")
+        seeds = Recipe.read(self.recipe_file).companion_dir
+        (seeds / "Settings").mkdir(parents=True)
+        (seeds / "Settings/profile.ini").write_text("portable")
+        (seeds / "help.txt").write_text("imported")
+        live = self.job / "current"
+        self.assertIn("Repair needed", self.cli("verify", success=False))
+        self.assertIn("Cached", self.cli("fetch"))
+        self.assertEqual((live / "help.txt").read_text(), "imported")
+        (live / "help.txt").write_text("edited by app")
+        self.page.write_text("SampleTool v1.28")
+        self.cli("fetch")
+        self.assertEqual((live / "help.txt").read_text(), "edited by app")
+        self.assertIn("Verified", self.cli("verify"))
+        (live / "Settings/profile.ini").unlink()
+        self.assertIn("Cached", self.cli("fetch"))
+        self.assertEqual((live / "Settings/profile.ini").read_text(), "portable")
+        catalog = Path(self.temp.name) / "moved"
+        catalog.mkdir()
+        seeds.parent.rename(catalog / "companions")
+        self.recipe_file = self.recipe_file.rename(catalog / self.recipe_file.name)
+        self.dest = catalog / "fresh"
+        self.cli("fetch")
+        self.assertEqual((self.dest / self.recipe["id"] / "current/help.txt").read_text(), "imported")
+
+    def test_companions_with_custom_file_target(self):
+        seeds = Recipe.read(self.recipe_file).companion_dir
+        seeds.mkdir(parents=True)
+        (seeds / "tool.ini").write_text("seed")
+        target = Path(self.temp.name) / "install/renamed.exe"
+        self.dest.mkdir()
+        (self.dest / "targets.json").write_text(json.dumps({self.recipe["id"]: str(target)}))
+        self.cli("fetch")
+        config = target.with_name("tool.ini")
+        self.assertFalse(config.exists())
+        self.recipe["apply_custom_settings"] = True
+        self.recipe_file.write_text(json.dumps(self.recipe))
+        self.assertIn("Cached", self.cli("fetch"))
+        self.assertEqual(config.read_text(), "seed")
+        config.write_text("edited")
+        self.assertIn("Apply custom settings", self.cli("verify", success=False))
+        self.assertIn("Cached", self.cli("fetch"))
+        self.assertEqual(config.read_text(), "seed")
+        self.recipe["apply_custom_settings"] = False
+        self.recipe_file.write_text(json.dumps(self.recipe))
+        config.write_text("edited")
+        self.assertIn("Verified", self.cli("verify"))
+        (seeds / "renamed.exe").write_text("conflict")
+        self.assertIn("conflicts", self.cli("fetch", success=False))
+        self.assertEqual(config.read_text(), "edited")
+
+    def test_settings_in_managed_app_with_publisher_default(self):
+        self.recipe["extract"].append("prefs.xml")
+        with zipfile.ZipFile(self.archive, "a") as package:
+            package.writestr("prefs.xml", "publisher")
+        self.recipe["settings_files"] = ["prefs.xml"]
+        self.recipe_file.write_text(json.dumps(self.recipe))
+        files = Recipe.read(self.recipe_file).companion_dir
+        files.mkdir(parents=True)
+        (files / "prefs.xml").write_text("custom")
+        (files / "restore.ps1").write_text("support")
+        self.cli("fetch")
+        live = self.job / "current"
+        self.assertEqual((live / "prefs.xml").read_text(), "publisher")
+        (live / "restore.ps1").write_text("working copy")
+        self.recipe["apply_custom_settings"] = True
+        self.recipe_file.write_text(json.dumps(self.recipe))
+        self.assertIn("Cached", self.cli("fetch"))
+        self.assertEqual((live / "prefs.xml").read_text(), "custom")
+        self.assertEqual((live / "restore.ps1").read_text(), "working copy")
+        self.assertIn("Verified", self.cli("verify"))
+        self.assertEqual(self.requests.count("/sample-tool.zip"), 1)
 
     def test_fetch_repeat_and_bad_update(self):
         self.assertIn(f"Missing manifest: {self.manifest}", self.cli("check"))
@@ -297,6 +410,8 @@ class ReleaseShelfTest(unittest.TestCase):
         self.assertIn("Updated", self.cli("fetch"))
 
     def test_cancel_before_or_after_publication_commit(self):
+        self.recipe["extract"] = ["SampleTool.exe"]
+        self.recipe_file.write_text(json.dumps(self.recipe))
         self.cli("fetch")
         previous = self.manifest.read_bytes()
         state = json.loads(previous)
@@ -430,10 +545,52 @@ class ReleaseShelfTest(unittest.TestCase):
         self.assertIn("Updated: 1.28", self.cli("fetch"))
         state = json.loads(self.manifest.read_text())
         self.assertNotEqual(previous, state["release"])
-        for release in [previous, state["release"]]:
-            folder = self.job / "releases" / release
-            self.assertEqual([p.name for p in folder.iterdir()], [self.recipe["filename"]])
+        folder = self.job / "releases" / state["release"]
+        self.assertEqual(list(folder.parent.iterdir()), [folder])
+        self.assertEqual([p.name for p in folder.iterdir()], [self.recipe["filename"]])
         self.assertIn("Latest: 1.28", self.cli("check"))
+
+    def test_fetch_latest_removes_legacy_cache_history(self):
+        self.cli("fetch")
+        releases = self.job / "releases"
+        stale = releases / ("a" * 32)
+        previous = self.job / ".previous-app"
+        personal = releases / "personal"
+        for folder in (stale, previous, personal):
+            folder.mkdir()
+            (folder / "file.txt").write_text("fixture")
+        self.cli("check")
+        self.cli("verify")
+        self.assertTrue(stale.is_dir())
+        self.assertTrue(previous.is_dir())
+        self.assertIn("Latest", self.cli("fetch"))
+        self.assertFalse(stale.exists())
+        self.assertFalse(previous.exists())
+        self.assertTrue((personal / "file.txt").is_file())
+        self.assertIn("Verified", self.cli("verify"))
+        self.assertEqual(self.requests.count("/sample-tool.zip"), 1)
+
+    def test_versioned_publication_removes_only_unchanged_managed_files(self):
+        self.recipe.pop("extract")
+        self.recipe["filename"] = "Tool-{version}.zip"
+        self.recipe_file.write_text(json.dumps(self.recipe))
+        self.cli("fetch")
+        live = self.job / "current"
+        legacy = self.job / "releases" / ("a" * 32)
+        legacy.mkdir()
+        (legacy / "Tool-1.26.zip").write_bytes(b"older archive")
+        (live / "Tool-1.26.zip").write_bytes(b"older archive")
+        self.assertIn("Latest", self.cli("fetch"))
+        self.assertFalse((live / "Tool-1.26.zip").exists())
+        self.page.write_text("SampleTool v1.28")
+        self.cli("fetch")
+        self.assertFalse((live / "Tool-1.27.zip").exists())
+        previous = live / "Tool-1.28.zip"
+        previous.write_bytes(b"personal changes")
+        self.page.write_text("SampleTool v1.29")
+        self.cli("fetch")
+        self.assertEqual(previous.read_bytes(), b"personal changes")
+        self.assertEqual((live / "Tool-1.29.zip").read_bytes(), self.archive.read_bytes())
 
     def test_versioned_iso_and_reissued_publisher_checksum(self):
         base_url = self.recipe["page"].rsplit("/", 1)[0]
@@ -557,6 +714,8 @@ class ReleaseShelfTest(unittest.TestCase):
         self.assertIn("Cached: 1.28", self.cli("fetch"))
         self.assertEqual(live.read_bytes(), b"updated")
         self.assertFalse((self.job / "pending.json").exists())
+        self.assertEqual([p.name for p in (self.job / "releases").iterdir()],
+                         [json.loads(self.manifest.read_text())["release"]])
         self.assertEqual(self.requests.count("/sample-tool.zip"), 2)
 
     @unittest.skipUnless(os.name == "nt", "Windows version resource")

@@ -44,10 +44,18 @@ class AppMenu(tk.Toplevel):
 
     def refresh_icons(self, palette):
         for button, name in self.icon_names.items():
-            normal = make_icon(self, name, palette.text)
-            disabled = make_icon(self, name, palette.muted)
-            button.configure(image=(normal, "disabled", disabled))
-            self.images[button] = (normal, disabled)
+            self.refresh_icon(button, name, palette)
+
+    def refresh_icon(self, button, name, palette):
+        normal = make_icon(self, name, palette.text)
+        disabled = make_icon(self, name, palette.muted)
+        button.configure(image=(normal, "disabled", disabled))
+        self.images[button] = (normal, disabled)
+
+    def set_action_icon(self, button, name, palette):
+        if self.icon_names[button] != name:
+            self.icon_names[button] = name
+            self.refresh_icon(button, name, palette)
 
     def refresh_labels(self):
         for label, button in self.buttons.items():
