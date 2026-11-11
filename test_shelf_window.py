@@ -596,6 +596,9 @@ class DesktopTest(unittest.TestCase):
             self.ui.column_menu.buttons[name].invoke()
         self.assertEqual(tree["displaycolumns"], ("Source",))
 
+        # Older releases persisted the Name column as "App name".
+        prefs = self.ui.columns_file
+        prefs.write_text(prefs.read_text(encoding="utf-8").replace("Name\n", "App name\n"), encoding="utf-8")
         second = tk.Toplevel(self.root)
         self.addCleanup(second.destroy)
         reopened = ShelfWindow(second, self.ui.catalog, self.dest, self.ui.targets,
@@ -947,7 +950,10 @@ class DesktopTest(unittest.TestCase):
             if widget.winfo_toplevel() != self.root:
                 continue
             if isinstance(widget, ttk.Button):
-                self.assertNotIn(widget.cget("text"), labels)
+                if widget.cget("text") == "Check for updates":
+                    self.assertIs(widget, self.ui.all_buttons["check"])
+                else:
+                    self.assertNotIn(widget.cget("text"), labels)
             elif isinstance(widget, tk.Text):
                 self.assertNotIn(str(self.dest / "alpha"), widget.get("1.0", "end"))
         editor = self.edit_selected()

@@ -8,7 +8,7 @@ While downloading, a progress bar appears beneath **Downloading…** in the item
 
 ## Run it
 
-Download `ReleaseShelf.exe` from [GitHub Releases](https://github.com/notuxius/ReleaseShelf/releases) once a release is available. Place it in a writable folder and double-click it. The executable includes Python. Saving your first app creates a `recipes` folder beside it. Keep that folder when replacing the EXE.
+Download `ReleaseShelf.exe` from [GitHub Releases](https://github.com/notuxius/ReleaseShelf/releases) once a release is available. Place it in a writable folder and double-click it. The executable includes Python. Saving your first item creates a `recipes` folder beside it. Keep that folder when replacing the EXE.
 
 To run from source, use Python 3.13 or newer. Double-click `releaseshelf_ui.pyw` or open PowerShell in this folder and run:
 
