@@ -77,7 +77,7 @@ class DesktopTest(unittest.TestCase):
             self.skipTest(f"No Tk display: {exc}")
         self.root.withdraw()
         self.addCleanup(self.root.destroy)
-        tmp = tempfile.TemporaryDirectory()
+        tmp = tempfile.TemporaryDirectory(dir=Path(tempfile.gettempdir()).resolve())
         self.addCleanup(tmp.cleanup)
         catalog = Path(tmp.name) / "catalog"
         catalog.mkdir()

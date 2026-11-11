@@ -39,7 +39,7 @@ class Publisher(SimpleHTTPRequestHandler):
 
 class ReleaseShelfTest(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory()
+        self.temp = tempfile.TemporaryDirectory(dir=Path(tempfile.gettempdir()).resolve())
         self.addCleanup(self.temp.cleanup)
         base = Path(self.temp.name)
         self.publisher = base / "publisher"
@@ -160,7 +160,8 @@ class ReleaseShelfTest(unittest.TestCase):
             package("1.0", {"tool.exe": b"exe", "settings/default.ini": b"first", "old.txt": b"old"})
             self.assertEqual(run("check").status, "Update available")
             self.assertFalse(link.exists())
-            self.assertEqual(run("fetch").status, "Updated")
+            result = run("fetch")
+            self.assertEqual(result.status, "Updated", result.detail)
             self.assertEqual(run("verify").status, "Verified")
             (live / "user.log").write_bytes(b"keep")
             (live / "settings/default.ini").unlink()

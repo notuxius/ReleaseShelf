@@ -32,7 +32,7 @@ if ($shell.CreateShortcut($env:RELEASESHELF_LINK).TargetPath -ne $env:RELEASESHE
     try:
         result = subprocess.run(
             [str(powershell), "-NoProfile", "-NonInteractive", "-Command", script],
-            env={**os.environ, "RELEASESHELF_LINK": str(temp), "RELEASESHELF_EXE": str(target)},
+            env={**os.environ, "RELEASESHELF_LINK": str(temp), "RELEASESHELF_EXE": str(target.resolve())},
             capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW, timeout=30,
         )
         if result.returncode:

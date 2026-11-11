@@ -59,6 +59,7 @@ def deletion_plan(mode, path, job, dest, targets):
     elif isinstance(job, Recipe):
         root = job.cache_root(dest)
         check_location(root)
+        root = root.resolve()
         cache = root if root.is_dir() else None
         releases = root / "releases"
         check_link(releases)
@@ -77,6 +78,7 @@ def deletion_plan(mode, path, job, dest, targets):
                 continue
             primary = Path(published["path"])
             check_location(primary)
+            primary = primary.resolve()
             filename(primary.name)
             managed = primary.parent in (root / "current", root / "bin")
             if not managed:
@@ -113,7 +115,7 @@ def deletion_plan(mode, path, job, dest, targets):
         check_location(target)
         resolved = target.resolve()
         if (resolved == Path(resolved.anchor) or any(p.is_relative_to(resolved) for p in protected)
-                or (resolved.parent == path.parent and resolved.suffix.lower() == ".json")):
+                or (resolved.parent == path.parent.resolve() and resolved.suffix.lower() == ".json")):
             raise ValueError(f"Cannot delete ReleaseShelf storage or a protected folder: {target}")
     return Deletion(tuple(sorted(files)), tuple(sorted(folders)), tuple(manifests), cache)
 
