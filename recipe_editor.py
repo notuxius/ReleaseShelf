@@ -112,9 +112,9 @@ def save_recipe(catalog, data, path, original):
 
 
 class RecipeEditor(tk.Toplevel):
-    def __init__(self, parent, catalog, path, palette, on_saved, *, on_action=None, categories=()):
+    def __init__(self, parent, catalog, path, palette, on_saved, *, on_action=None, categories=(), example=None):
         self.original = path.read_bytes() if path is not None else None
-        self.data = {}
+        self.data = dict(example or {})
         raw = None
         if self.original is not None:
             content = self.original.decode("utf-8-sig")
@@ -156,7 +156,7 @@ class RecipeEditor(tk.Toplevel):
         else:
             catalog_tab = ttk.Frame(tabs, padding=TAB_PADDING)
             catalog_tab.columnconfigure(1, weight=1)
-            self.add_tab(catalog_tab, "Catalog", "folders")
+            self.add_tab(catalog_tab, "General", "folders")
             first = self.field(catalog_tab, 0, "id")
             ttk.Label(catalog_tab, text=tr("Choose a unique item ID, such as my-tool."),
                       style="Muted.TLabel").grid(row=1, column=1, sticky="w", pady=(0, 10))
@@ -290,11 +290,13 @@ class RecipeEditor(tk.Toplevel):
             button.pack(side="left", padx=(0, 6))
             self.buttons[action] = button
 
-    def set_app_info(self, title, detail):
+    def set_app_info(self, title, detail, result="", *, error=False):
         self.detail_title.set_text(title)
         self.detail.configure(state="normal")
         self.detail.delete("1.0", "end")
         self.detail.insert("1.0", detail)
+        if result:
+            self.detail.insert("end", "\n\n" + result, ("error",) if error else ())
         self.detail.configure(state="disabled")
 
     def set_busy(self, busy):
@@ -379,6 +381,7 @@ class RecipeEditor(tk.Toplevel):
                                  highlightthickness=1, highlightbackground=palette.line,
                                  highlightcolor=palette.accent, relief="flat", padx=5, pady=3)
         if self.detail is not None:
+            self.detail.tag_configure("error", foreground=palette.error)
             self.detail.configure(bg=palette.surface, fg=palette.text, insertbackground=palette.text,
                                   selectbackground=palette.selection, selectforeground=palette.text)
         if self.winfo_ismapped():

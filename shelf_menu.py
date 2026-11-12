@@ -19,6 +19,7 @@ class AppMenu(tk.Toplevel):
         self.panel = ttk.Frame(self.border, style="Surface.TFrame", padding=4)
         self.panel.pack(fill="both", expand=True)
         self.buttons = {}
+        self.opening_pointer = None
         self.icon_names = {}
         self.images = {}
         self.bind("<ButtonPress>", self.outside_press)
@@ -68,16 +69,20 @@ class AppMenu(tk.Toplevel):
 
     def add_button(self, label, button):
         button.pack(fill="x")
-        button.bind("<Enter>", lambda _: self.highlight(button))
-        button.bind("<Motion>", lambda _: self.highlight(button))
-        button.bind("<Leave>", lambda _: self.focus_set() if self.winfo_viewable() else None)
+        for event in ("<Enter>", "<Motion>"):
+            button.bind(event, lambda e: self.hover_choice(e, button))
+        button.bind("<Leave>", self.hover_choice)
         self.buttons[label] = button
 
     def add_separator(self):
         ttk.Frame(self.panel, height=1, style="Line.TFrame").pack(fill="x", padx=10, pady=4)
 
-    def highlight(self, button):
-        target = self if button.instate(["disabled"]) else button
+    def hover_choice(self, event, button=None):
+        # Mapping a popup can send pointer events before the mouse has moved.
+        if (event.x_root, event.y_root) == self.opening_pointer or not self.winfo_viewable():
+            return
+        self.opening_pointer = None
+        target = button if button is not None and button.instate(["!disabled"]) else self
         if self.focus_get() != target:
             target.focus_set()
 
@@ -105,14 +110,21 @@ class AppMenu(tk.Toplevel):
         self.show_at(x, y, keyboard=keyboard)
 
     def show_at(self, x, y, *, keyboard=False):
+        self.opening_pointer = self.master.winfo_pointerxy() if keyboard else None
         self.geometry(f"+{x}+{y}")
         self.deiconify()
         self.lift()
         self.update_idletasks()
         self.grab_set()
         self.focus_force()
+        self.focus_on_open(keyboard)
+
+    def focus_on_open(self, keyboard):
         if keyboard:
-            self.move_focus(1)
+            for button in self.buttons.values():
+                if button.instate(["!disabled"]):
+                    button.focus_set()
+                    break
 
     def outside_press(self, event):
         x, y = event.x_root - self.winfo_rootx(), event.y_root - self.winfo_rooty()

@@ -87,7 +87,7 @@ def cache_issue(root, recipe, state, archive, full):
     folder = root / "releases" / state["release"]
     if not folder.is_dir():
         return message("Missing release folder: {folder}", folder=folder)
-    names = recipe.expected_files(archive)
+    names = recipe.versioned_members(state["version"]).expected_files(archive)
     if recipe.extract_folder:
         names = set(names).union(tree_members(state))
     for name in names:
@@ -176,7 +176,7 @@ def companion_files(source, target):
     if not source.exists():
         return files
     if target.parent.resolve().is_relative_to(source.resolve()):
-        raise ValueError("The app folder must be outside its catalog companion folder.")
+        raise ValueError("The app folder must be outside its companion folder.")
 
     def collect(directory):
         for path in directory.iterdir():
@@ -332,8 +332,9 @@ def download(root, recipe, release, on_progress=None, *, local_source=None):
     with tempfile.TemporaryDirectory(dir=root, prefix=".stage-") as temp:
         folder = Path(temp) / "payload"
         folder.mkdir()
-        stage_release(recipe, release, folder, on_progress, local_source=local_source)
-        names = recipe.expected_files(release.archive)
+        members = recipe.versioned_members(release.version)
+        stage_release(members, release, folder, on_progress, local_source=local_source)
+        names = members.expected_files(release.archive)
         if recipe.extract_folder:
             names = [release.archive, *(p.relative_to(folder).as_posix() for p in
                                         (folder / "files").rglob("*") if p.is_file())]
@@ -425,7 +426,7 @@ def publish(root, recipe, state, output, archive, previous):
     folder = root / "releases" / state["release"]
     state["archive"] = archive
     if "stats" not in state:
-        state["stats"] = {name: stamp(folder / name) for name in recipe.expected_files(archive)}
+        state["stats"] = {name: stamp(folder / name) for name in recipe.versioned_members(state["version"]).expected_files(archive)}
     target = output.path
     checksum = state["sha256"][output.member]
     temp = None
@@ -488,7 +489,7 @@ def run_release(action, root, recipe, release, override, on_progress=None, *, de
     state = read_state(root, "current.json")
     pending = read_state(root, "pending.json")
     local = state["version"] if state else "-"
-    output = Output.for_release(root, recipe, release.archive, override, state or pending)
+    output = Output.for_release(root, recipe.versioned_members(release.version), release.archive, override, state or pending)
     same = matches(state, recipe, release)
     issue = cache_issue(root, recipe, state, release.archive, action == "fetch") if same else ""
     if same and not issue:
@@ -552,7 +553,7 @@ def verify(root, recipe, override):
     if not recipe.matches_fingerprint(state.get("recipe")):
         return Result("Repair needed", local, detail="Recipe differs from the saved release")
     archive = filename(state.get("archive", recipe.archive))
-    output = Output.for_release(root, recipe, archive, override, state)
+    output = Output.for_release(root, recipe.versioned_members(local), archive, override, state)
     issue = cache_issue(root, recipe, state, archive, True) or output.issue(state, True)
     if issue:
         return Result("Repair needed", local, detail=issue)

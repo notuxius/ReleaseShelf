@@ -22,7 +22,6 @@ class LanguageMenu(DropdownMenu):
         self.rows = (len(self.codes) + 1) // 2
         self.selected = self.codes[0]
         self.prefix, self.typed_at = "", 0
-        self.opening_pointer = None
         self.labels = {}
         self.search_names = {code: tuple(search_text(name) for name in names)
                              for code, names in LANGUAGES.items()}
@@ -95,16 +94,8 @@ class LanguageMenu(DropdownMenu):
             button.invoke()
         return "break"
 
-    def hover_choice(self, event, button):
-        if (event.x_root, event.y_root) != self.opening_pointer:
-            self.opening_pointer = None
-            self.highlight(button)
-
     def show_attached(self, bounds, *, keyboard=False):
         owner = self.master
-        # Mapping the popup under a stationary pointer can generate a motion event.
-        # Keep keyboard focus on the selected language until the pointer moves.
-        self.opening_pointer = owner.winfo_pointerxy() if keyboard else None
         self.prefix = ""
         left, top, right, bottom = bounds
         above = owner.winfo_rooty() - top
@@ -122,7 +113,9 @@ class LanguageMenu(DropdownMenu):
         self.canvas.configure(width=max(1, width - frame_width), height=height,
                               yscrollincrement=max(1, self.items.winfo_reqheight() // self.rows))
         self.update_idletasks()
-        super().show_attached(bounds)
+        super().show_attached(bounds, keyboard=keyboard)
+
+    def focus_on_open(self, keyboard):
         self.focus_code(self.selected)
 
     def focus_changed(self, code, focused):

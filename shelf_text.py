@@ -30,10 +30,65 @@ def fit_text(widget, font, text, width, suffix=""):
     return line[:low] + ending
 
 
+class FullTextTooltip:
+    def __init__(self, widget, text_at):
+        self.widget = widget
+        self.text_at = text_at
+        self.pending = None
+        self.label = None
+        widget.bind("<Motion>", self.motion, add="+")
+        for event in ("<Leave>", "<ButtonPress>", "<MouseWheel>", "<Unmap>", "<Destroy>"):
+            widget.bind(event, self.hide, add="+")
+
+    def hide(self, _event=None):
+        if self.pending is not None:
+            self.widget.after_cancel(self.pending)
+            self.pending = None
+        if self.label is not None:
+            self.label.destroy()
+            self.label = None
+
+    def motion(self, event):
+        self.hide()
+        if not event.state & 0x700:  # No tooltip while dragging.
+            self.pending = self.widget.after(500, self.show, event.x, event.y)
+
+    def show(self, x, y):
+        self.pending = None
+        text = self.text_at(x, y)
+        if not text:
+            self.hide()
+            return
+        root = self.widget.winfo_toplevel()
+        if self.label is None:
+            self.label = ttk.Label(root, style="SidebarHint.TLabel", justify="left")
+        label = self.label
+        label.configure(text=text, wraplength=max(1, min(560, root.winfo_width() - 20)))
+        left = self.widget.winfo_rootx() - root.winfo_rootx() + x
+        top = self.widget.winfo_rooty() - root.winfo_rooty() + y
+        left = max(0, min(left, root.winfo_width() - label.winfo_reqwidth()))
+        height = label.winfo_reqheight()
+        top = top + 18 if top + 18 + height <= root.winfo_height() else max(0, top - height - 4)
+        label.place(x=left, y=top)
+        label.lift()
+        # A status update or column resize can change the text under a stationary pointer.
+        self.pending = self.widget.after(250, self.show, x, y)
+
+
+def label_tooltip(label, original):
+    def clipped_text(_x, _y):
+        text = original()
+        if text != str(label["text"]):
+            return text
+
+    return FullTextTooltip(label, clipped_text)
+
+
 class FittedLabel(ttk.Label):
     def __init__(self, master, **options):
         super().__init__(master, width=1, **options)
         self.full_text = ""
+        label_tooltip(self, lambda: self.full_text)
         self.bind("<Configure>", self.fit)
         self.bind("<<ThemeChanged>>", self.fit)
 
@@ -61,9 +116,28 @@ class FittedTreeview(ttk.Treeview):
         self.widths = ()
         self.pending_fit = None
         self.style = ttk.Style(self)
+        FullTextTooltip(self, self.clipped_text_at)
         for event in ("<Map>", "<Configure>", "<B1-Motion>", "<ButtonRelease-1>"):
             self.bind(event, self.schedule_fit, add="+")
         self.bind("<<ThemeChanged>>", self.theme_changed)
+
+    def clipped_text_at(self, x, y):
+        region = self.identify_region(x, y)
+        display_col = self.identify_column(x)
+        if region not in ("heading", "cell") or display_col in ("", "#0"):
+            return
+        col = self.column(display_col, "id")
+        if region == "heading":
+            if col in self.captions:
+                full = "".join(self.captions[col])
+                if full != self.heading(col, "text"):
+                    return full
+        else:
+            row = self.identify_row(y)
+            if row in self.rows:
+                full = str(self.rows[row][self["columns"].index(col)])
+                if full != self.set(row, col):
+                    return full
 
     def theme_changed(self, _event):
         self.widths = ()

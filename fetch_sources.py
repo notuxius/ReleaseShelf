@@ -12,12 +12,12 @@ import tarfile
 import tempfile
 import zipfile
 from contextlib import closing
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from time import monotonic
-from urllib.parse import quote, unquote, urlsplit
+from urllib.parse import quote, unquote, urlencode, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from shelf_cancel import check_canceled, file_sha256, publisher_items, read_chunks
@@ -72,8 +72,8 @@ class CheckedRedirect(HTTPRedirectHandler):
         return super().redirect_request(req, fp, code, msg, headers, source_url(newurl))
 
 
-def open_url(url, *, method=None):
-    request = Request(source_url(url), headers={"User-Agent": f"ReleaseShelf/{__version__}"}, method=method)
+def open_url(url, *, method=None, data=None):
+    request = Request(source_url(url), headers={"User-Agent": f"ReleaseShelf/{__version__}"}, method=method, data=data)
     return build_opener(CheckedRedirect()).open(request, timeout=30)
 
 
@@ -348,6 +348,16 @@ class Recipe:
             checksum = published
         return Release(version, source_url(chosen["browser_download_url"]), archive, checksum)
 
+    def versioned_members(self, version):
+        if not any("{version}" in name for name in self.extract):
+            return self
+        names = tuple(filename(name.replace("{version}", version)) for name in self.extract)
+        if len({name.casefold() for name in names}) != len(names):
+            raise ValueError("Duplicate extraction filenames")
+        return replace(self, extract=names,
+                       publish_exe=self.publish_exe.replace("{version}", version),
+                       product_version=self.product_version.replace("{version}", version))
+
     def expected_files(self, archive):
         return [archive, *["files/" + name for name in self.extract]]
 
@@ -417,6 +427,20 @@ def download_chunks(recipe, release):
     stream = (open_windows_iso(release.version, release.checksum) if recipe.download_resolver
               else open_url(release.download))
     with stream as response:
+        if ((urlsplit(release.download).hostname or "").endswith(".ucoz.ru")
+                and response.headers.get_content_type() == "text/html"):
+            # uCoz serves a same-URL confirmation form before executable downloads.
+            form = response.read(16_384)
+            token = re.search(rb'<input type="hidden" name="ses" value="([^"<>]{1,256})"', form)
+            if token is None or response.url != release.download:
+                raise ValueError("Unrecognized publisher download confirmation")
+        else:
+            yield from response_chunks(response)
+            return
+    data = urlencode({"ses": token[1]}).encode("ascii")
+    with open_url(release.download, data=data) as response:
+        if response.headers.get_content_type() == "text/html":
+            raise ValueError("Publisher returned a confirmation page instead of the archive")
         yield from response_chunks(response)
 
 

@@ -97,6 +97,7 @@ def load_app_icon(master, job, dest):
         state = read_state(root, "current.json") or read_state(root, "pending.json")
         if not state:
             return None
+        job = job.versioned_members(state["version"])
         primary = job.primary(filename(state.get("archive", job.archive)))
         if primary.lower().endswith(".iso"):
             return _disc_icon(master)

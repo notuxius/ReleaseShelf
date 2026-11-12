@@ -12,6 +12,7 @@ from recipe_editor import recipe_bytes
 from releaseshelf import ERRORS, read_jobs
 from shelf_checklist import LocalItem
 from shelf_i18n import tr
+from shelf_icons import make_icon
 from shelf_message import error_detail
 from shelf_paint import show_window, stage_window
 from shelf_theme import category_picker, initial_geometry, style_titlebar
@@ -29,7 +30,7 @@ def change_category(catalog, members, source, destination, *, rename):
         current = {path: job.id for path, job in apps.items()
                    if job.category == source and (rename or path in members)}
         if current != members:
-            raise ValueError("The category changed on disk. Reload the catalog and try again.")
+            raise ValueError("The category changed on disk. Reload the app list and try again.")
         if destination == source:
             return
         if rename and any(job.category == destination for job in apps.values()):
@@ -81,8 +82,12 @@ class CategoryDialog(tk.Toplevel):
         ttk.Label(frame, textvariable=self.error, style="EditorError.TLabel", wraplength=360).pack(fill="x")
         actions = ttk.Frame(frame)
         actions.pack(anchor="e", pady=(8, 0))
-        ttk.Button(actions, text=tr("Cancel"), command=self.destroy).pack(side="left", padx=(0, 8))
-        save = ttk.Button(actions, text=tr("Save"), style="Primary.TButton", command=self.save)
+        self.cancel_icon = make_icon(self, "diskette_x", palette.text)
+        self.save_icon = make_icon(self, "save", palette.on_accent)
+        ttk.Button(actions, text=tr("Cancel"), image=self.cancel_icon, compound="left",
+                   command=self.destroy).pack(side="left", padx=(0, 8))
+        save = ttk.Button(actions, text=tr("Save"), image=self.save_icon, compound="left",
+                          style="Primary.TButton", command=self.save)
         save.pack(side="left")
         if choices is None:
             def enable_save(*_):

@@ -1,4 +1,4 @@
-"""ReleaseShelf: check publishers, fetch portable apps, or verify the local catalog."""
+"""ReleaseShelf: check publishers, fetch portable apps, or verify local files."""
 
 import argparse
 import json
@@ -107,21 +107,26 @@ def exit_code(action, result, batch):
     return 0
 
 
+def add_recipes_argument(parser):
+    parser.add_argument("--recipes", type=Path, default=DEFAULT_CATALOG, help="folder containing recipe files")
+    parser.add_argument("--catalog", dest="recipes", type=Path, help=argparse.SUPPRESS)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=["check", "fetch", "verify"])
     selection = parser.add_mutually_exclusive_group(required=True)
     selection.add_argument("recipe", type=Path, nargs="?")
-    selection.add_argument("--all", action="store_true", help="run every JSON recipe in the catalog")
-    parser.add_argument("--catalog", type=Path, default=DEFAULT_CATALOG, help="recipe directory for --all")
+    selection.add_argument("--all", action="store_true", help="run every JSON recipe in the recipe folder")
+    add_recipes_argument(parser)
     parser.add_argument("--dest", type=Path)
     parser.add_argument("--targets", type=Path, help="machine-local output paths (default: DEST/targets.json)")
     args = parser.parse_args(argv)
     dest = (args.dest or default_destination()).resolve()
     targets = load_targets(args.targets or dest / "targets.json", dest)
-    paths = sorted(args.catalog.glob("*.json")) if args.all else [args.recipe]
+    paths = sorted(args.recipes.glob("*.json")) if args.all else [args.recipe]
     if not paths:
-        raise ValueError(f"No JSON recipes in {args.catalog}")
+        raise ValueError(f"No JSON recipes in {args.recipes}")
     jobs = read_jobs(paths)
     codes = []
     if args.all:

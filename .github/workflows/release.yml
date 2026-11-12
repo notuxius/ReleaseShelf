@@ -20,7 +20,7 @@ jobs:
           $version = python -c "from shelf_version import __version__; print(__version__)"
           if ($env:GITHUB_REF_NAME -cne "v$version") { throw "Tag must match shelf_version.py" }
       - name: Run tests
-        run: python -m unittest discover -v
+        run: python run_tests.py
       - name: Install PyInstaller
         run: python -m pip install pyinstaller==6.22.3
       - name: Build executable

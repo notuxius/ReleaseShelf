@@ -30,6 +30,10 @@ class Palette:
     is_dark: bool = False
     tab_indicator: str = ""
 
+    @property
+    def error(self):
+        return "#f5afa6" if self.is_dark else "#a12d26"
+
 
 LIGHT = Palette("#f8f9f7", "#ffffff", "#eff2ef", "#d8dedb", "#202c2a",
                 "#536460", "#096b60", "#ffffff", "#07594f", "#d8eee6")
@@ -148,15 +152,21 @@ def style_titlebar(root, dark):
                                                    ctypes.byref(value), ctypes.sizeof(value))
 
 
-def work_area(window):
+def work_area(window, *, bounds=None):
     if os.name == "nt":
         class MonitorInfo(ctypes.Structure):
             _fields_ = [("size", wintypes.DWORD), ("monitor", wintypes.RECT),
                         ("work", wintypes.RECT), ("flags", wintypes.DWORD)]
 
         user32 = ctypes.windll.user32
-        user32.MonitorFromWindow.restype = wintypes.HANDLE
-        monitor = user32.MonitorFromWindow(wintypes.HWND(window.winfo_id()), 2)  # Nearest monitor
+        if bounds is None:
+            user32.MonitorFromWindow.restype = wintypes.HANDLE
+            monitor = user32.MonitorFromWindow(wintypes.HWND(window.winfo_id()), 2)
+        else:
+            x, y, width, height = bounds
+            rect = wintypes.RECT(x, y, x + width, y + height)
+            user32.MonitorFromRect.restype = wintypes.HANDLE
+            monitor = user32.MonitorFromRect(ctypes.byref(rect), 2)
         info = MonitorInfo()
         info.size = ctypes.sizeof(info)
         if user32.GetMonitorInfoW(wintypes.HANDLE(monitor), ctypes.byref(info)):
@@ -208,9 +218,10 @@ def style_heading_dividers(style, color):
     style.tk.call(bottom_line, "put", color, "-to", 0, 0, 256, 1)
 
 
-def style_dropdown_arrows(style, color):
+def style_dropdowns(style, palette):
     indicator = "ReleaseShelf.dropdownIndicator"
     down, up = "ReleaseShelfDropdownDown", "ReleaseShelfDropdownUp"
+    field, focus = "ReleaseShelfComboField", "ReleaseShelfComboFocus"
     if indicator not in style.element_names():
         # Leave 8 px before the triangle and 12 px between it and the button edge.
         for image in (down, up):
@@ -218,7 +229,13 @@ def style_dropdown_arrows(style, color):
         style.element_create(indicator, "image", down, ("selected", up))
         combo_arrow = "ReleaseShelf.comboArrow"
         style.element_create(combo_arrow, "image", down, ("pressed", up))
-        style.layout("TCombobox", [("Combobox.field", {"sticky": "nswe", "children": [
+        # A square, fully painted field avoids clam's exposed corner pixels.
+        for image in (field, focus):
+            style.tk.call("image", "create", "photo", image, "-width", 64, "-height", 32)
+        combo_field = "ReleaseShelf.comboField"
+        style.element_create(combo_field, "image", field, ("pressed", focus), ("focus", focus),
+                             ("active", focus), border=1, width=1, height=1, sticky="nsew")
+        style.layout("TCombobox", [(combo_field, {"sticky": "nswe", "children": [
             (combo_arrow, {"side": "right", "sticky": ""}),
             ("Combobox.padding", {"sticky": "nswe", "children": [
                 ("Combobox.textarea", {"sticky": "nswe"})]})]})])
@@ -229,17 +246,31 @@ def style_dropdown_arrows(style, color):
                     ("Menubutton.label", {"side": "left", "sticky": ""})]})]})]})])
     for row in range(6):
         for image, y in ((down, row), (up, 5 - row)):
-            style.tk.call(image, "put", color, "-to", 8 + row, y, 19 - row, y + 1)
+            style.tk.call(image, "put", palette.muted, "-to", 8 + row, y, 19 - row, y + 1)
+    for image, outline in ((field, palette.line), (focus, palette.accent)):
+        style.tk.call(image, "put", outline, "-to", 0, 0, 64, 32)
+        style.tk.call(image, "put", palette.surface, "-to", 1, 1, 63, 31)
 
 
 def category_picker(parent, variable, choices, *, width):
     field = ttk.Combobox(parent, textvariable=variable, values=choices, width=width, height=10,
                          font=("Segoe UI", 10))
     style = ttk.Style(parent)
+    popup = field.tk.call("ttk::combobox::PopdownWindow", field)
+    frame = f"{popup}.f"
+    call = field.tk.call
+    call(frame, "configure", "-style", "Surface.TFrame")
+    call("grid", "configure", frame, "-padx", 1, "-pady", (0, 1))
+
+    def join_popup():
+        below = call("winfo", "rooty", popup) >= field.winfo_rooty()
+        call("grid", "configure", frame, "-pady", (0, 1) if below else (1, 0))
+
+    call("bind", popup, "<Configure>", field.register(join_popup))
 
     def style_popup():
         # Tk builds the popup with a classic listbox outside the ttk style system.
-        popup = field.tk.call("ttk::combobox::PopdownWindow", field)
+        call(popup, "configure", "-background", style.lookup("Focus.TFrame", "background"))
         field.tk.call(f"{popup}.f.l", "configure", "-font", field.cget("font"),
                       "-background", style.lookup("TCombobox", "fieldbackground"),
                       "-foreground", style.lookup("TCombobox", "foreground"),
@@ -283,10 +314,10 @@ def style_widgets(s, p):
                 bordercolor=p.line, lightcolor=p.surface, darkcolor=p.surface,
                 troughcolor=p.canvas, focuscolor=p.accent, focussolid=True)
     s.configure("Surface.TFrame", background=p.surface)
+    s.configure("TSizegrip", background=p.surface)
     s.configure("Line.TFrame", background=p.line)
     s.configure("Focus.TFrame", background=p.accent)
     s.configure("Sidebar.TFrame", background=p.subtle)
-    s.configure("SidebarHeading.TLabel", background=p.subtle, foreground=p.muted, font=("Segoe UI Semibold", 9))
     s.configure("SidebarHint.TLabel", background=p.text, foreground=p.surface, padding=(7, 4),
                 font=("Segoe UI", 9))
     s.configure("Title.TLabel", background=p.canvas, font=("Segoe UI Semibold", 24))
@@ -294,15 +325,12 @@ def style_widgets(s, p):
     s.configure("Empty.TLabel", background=p.surface, font=("Segoe UI Semibold", 13))
     s.configure("Brand.TLabel", background=p.surface, font=("Segoe UI Semibold", 15))
     s.configure("Muted.TLabel", foreground=p.muted)
-    s.configure("EditorError.TLabel", foreground="#f5afa6" if p.is_dark else "#a12d26")
+    s.configure("EditorError.TLabel", foreground=p.error)
     s.configure("TEntry", fieldbackground=p.surface, foreground=p.text, insertcolor=p.text,
                 selectbackground=p.selection, selectforeground=p.text, padding=5)
     s.configure("TCombobox", fieldbackground=p.surface, foreground=p.text, insertcolor=p.text,
-                selectbackground=p.selection, selectforeground=p.text, bordercolor=p.line,
-                lightcolor=p.surface, darkcolor=p.surface, padding=(8, 6))
-    s.map("TCombobox", bordercolor=[("pressed", p.accent), ("focus", p.accent), ("active", p.accent)])
-    s.configure("ComboboxPopdownFrame", bordercolor=p.line, lightcolor=p.line, darkcolor=p.line,
-                background=p.surface, relief="solid", borderwidth=1)
+                selectbackground=p.selection, selectforeground=p.text, padding=(8, 6),
+                postoffset=(0, 1, 0, -2))  # Overlap the field outline by 1 px in either direction.
     # Blend clam's bevel and inner focus ring into the fill. Only the outer
     # border changes color on hover or keyboard focus for every dropdown.
     s.configure("TMenubutton", padding=(10, 7), background=p.surface, borderwidth=1,
@@ -311,7 +339,7 @@ def style_widgets(s, p):
     s.map("TMenubutton", background=menu_fill, lightcolor=menu_fill, darkcolor=menu_fill,
           focuscolor=menu_fill, foreground=[("disabled", p.muted)],
           bordercolor=[("disabled", p.line), ("selected", p.line), ("focus", p.accent), ("active", p.accent)])
-    style_dropdown_arrows(s, p.muted)
+    style_dropdowns(s, p)
     s.configure("More.TMenubutton", padding=(10, 7, 0, 7), space=6)
     s.configure("LanguagePicker.TMenubutton", padding=(12, 8), space=9, font=("Segoe UI Semibold", 10))
     s.layout("LanguageItem.TButton", [("Button.border", {"sticky": "nsew", "border": 1,
@@ -393,9 +421,11 @@ def style_widgets(s, p):
     s.configure("Treeview", rowheight=42, background=p.surface, foreground=p.text)
     s.configure("Categories.Treeview", rowheight=32, background=p.subtle, fieldbackground=p.subtle)
     s.configure("Treeview.Cell", padding=(TREE_TEXT_PAD, 0))
+    s.configure("Categories.Treeview.Cell", padding=(6, 0, TREE_TEXT_PAD, 0))
     # Center app icons and checklist boxes in the leading column of these flat tables.
     s.layout("Treeview.Item", [("Treeitem.image", {"sticky": ""})])
-    s.map("Treeview", background=[("selected", p.selection)], foreground=[("selected", p.text)])
+    # Keep tagged error text visible on the selection background.
+    s.map("Treeview", background=[("selected", p.selection)], foreground=[])
     style_heading_dividers(s, p.line)
     s.configure("Treeview.Heading", font=("Segoe UI Semibold", 9), background=p.canvas,
                 foreground=p.muted, padding=(TREE_TEXT_PAD, 8), relief="flat", borderwidth=0)
@@ -403,3 +433,5 @@ def style_widgets(s, p):
     s.configure("TScrollbar", background=p.subtle, troughcolor=p.surface, arrowcolor=p.muted,
                 arrowsize=11, borderwidth=0, lightcolor=p.subtle, darkcolor=p.subtle)
     s.map("TScrollbar", background=[("active", p.line)])
+    # The catalog card already draws the outer edge beside this scrollbar.
+    s.configure("Catalog.Vertical.TScrollbar", bordercolor=p.surface)

@@ -25,7 +25,7 @@ class ChecklistWindow(tk.Toplevel):
         self.data = json.loads(self.original.decode("utf-8-sig"))
         self.item = catalog_item(self.data)
         if not isinstance(self.item, Checklist):
-            raise ValueError("The checklist changed. Reopen it from the catalog.")
+            raise ValueError("The checklist changed. Reopen it from the app list.")
         super().__init__(parent)
         stage_window(self)
         self.path, self.catalog, self.on_saved = path, catalog, on_saved

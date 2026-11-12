@@ -131,7 +131,7 @@ def delete_item(mode, path, job, original, plan, dest, targets):
             check_location(plan.cache / ".fetch.lock")
         with fetch_lock(plan.cache) if plan.cache else nullcontext():
             if deletion_plan(mode, path, job, dest, targets) != plan:
-                raise ValueError("Reload the catalog and try again.")
+                raise ValueError("Reload the app list and try again.")
             for file in plan.files:
                 file.unlink()
             for folder in plan.folders:

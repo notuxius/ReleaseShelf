@@ -12,12 +12,12 @@ class _Scrollbar(ttk.Scrollbar):
             self.grid()
 
 
-def grid_scrollable(widget, *, horizontal=False, reserve_space=True):
+def grid_scrollable(widget, *, horizontal=False, reserve_space=True, vertical_style=None):
     parent = widget.master
     parent.rowconfigure(0, weight=1)
     parent.columnconfigure(0, weight=1)
     widget.grid(row=0, column=0, sticky="nsew")
-    vertical = _Scrollbar(parent, orient="vertical", command=widget.yview)
+    vertical = _Scrollbar(parent, orient="vertical", command=widget.yview, style=vertical_style)
     vertical.grid(row=0, column=1, sticky="nsew")
     widget.configure(yscrollcommand=vertical.set)
     if horizontal:

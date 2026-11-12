@@ -19,10 +19,10 @@ from fetch_store import Result
 from shelf_categories import MOVE, RENAME, CategoryDialog, change_category
 from shelf_delete import DELETE, DATA, FOLDER, delete_item, deletion_plan
 from shelf_checkboxes import header_image
-from shelf_window import ShelfWindow
+from shelf_window import ShelfWindow, deletion_dialog
 from shelf_i18n import LANGUAGES, catalog, tr
 from shelf_options import read_language
-from shelf_theme import DARK, LIGHT, PALETTES, read_appearance
+from shelf_theme import DARK, LIGHT, PALETTES, category_picker, read_appearance
 
 
 def descendants(widget):
@@ -111,7 +111,7 @@ class DesktopTest(unittest.TestCase):
         self.assertTrue(menu.winfo_viewable())
         toggle = "Enable updates" if getattr(self.ui.jobs[key], "updates_disabled", False) else "Disable updates"
         labels = ("Check for updates", "Get updates", "Verify files", toggle,
-                  "Open app folder", MOVE, "Edit item", DELETE, DATA, FOLDER)
+                  "Install", "Open app folder", MOVE, "Edit item", DELETE, DATA, FOLDER)
         self.assertEqual([button.cget("text") for button in menu.buttons.values()],
                          [tr("Cancel" if label == cancel_for else label) for label in labels])
         return menu
@@ -153,6 +153,93 @@ class DesktopTest(unittest.TestCase):
             launch.assert_called_once()
             self.assertIn("Get updates", self.ui.status.get())
 
+    def test_install_opens_clicked_published_package(self):
+        first, second = self.keys
+        root = self.ui.jobs[second].cache_root(self.dest)
+        root.mkdir(parents=True)
+        package = self.dest / "Setup package.MSI"
+        package.touch()
+        (root / "current.json").write_text(json.dumps({
+            "version": "1", "release": "a" * 32, "sha256": {}, "published": {"path": str(package)},
+        }))
+        self.ui.tree.selection_set(first)
+        with patch("shelf_window.os.startfile", create=True) as launch:
+            self.right_click_app(second).buttons["Install"].invoke()
+            launch.assert_called_once_with(package, cwd=package.parent)
+            self.assertTrue(self.right_click_app(first).buttons["Install"].instate(["disabled"]))
+            self.ui.app_menu.dismiss()
+            package.unlink()
+            self.assertTrue(self.right_click_app(second).buttons["Install"].instate(["!disabled"]))
+
+    def test_install_fetches_clicked_item_then_reuses_verified_cache(self):
+        first, second = self.keys
+        recipe = Path(second)
+        recipe.write_text(json.dumps({**json.loads(recipe.read_text()), "filename": "Setup.MSI"}))
+        self.ui.reload()
+        package = self.dest / "beta" / "current" / "Setup.MSI"
+        response = GatedDownload()
+        with (
+            patch("fetch_sources.read_page", return_value="1") as check,
+            patch("fetch_sources.open_url", return_value=response) as download,
+            patch("shelf_window.os.startfile", create=True) as launch,
+        ):
+            self.right_click_app(second).buttons["Install"].invoke()
+            try:
+                self.wait_for(response.waiting.is_set)
+                self.ui.tree.selection_set(first)
+                launch.assert_not_called()
+            finally:
+                response.resume.set()
+                self.wait_until_idle()
+            self.assertEqual(package.read_bytes(), b"download")
+            launch.assert_called_once_with(package, cwd=package.parent)
+            package.unlink()
+            self.click(self.right_click_app(second).buttons["Install"])
+            self.assertEqual(self.ui.results[second].status, "Cached")
+            self.assertEqual(launch.call_count, 2)
+            download.assert_called_once()
+            check.reset_mock()
+            self.right_click_app(second).buttons["Install"].invoke()
+            self.assertEqual(launch.call_count, 3)
+            check.assert_not_called()
+
+    def test_failed_or_canceled_install_does_not_launch(self):
+        key = self.keys[0]
+        recipe = Path(key)
+        recipe.write_text(json.dumps({**json.loads(recipe.read_text()), "filename": "Setup.exe"}))
+        self.ui.reload()
+        with patch("shelf_window.os.startfile", create=True) as launch:
+            with patch("fetch_sources.read_page", side_effect=OSError("Publisher unavailable")):
+                self.click(self.right_click_app(key).buttons["Install"])
+                self.assertIn("Publisher unavailable", self.ui.status.get())
+            response = GatedDownload()
+            with patch("fetch_sources.read_page", return_value="1"), patch("fetch_sources.open_url", return_value=response):
+                self.right_click_app(key).buttons["Install"].invoke()
+                try:
+                    self.wait_for(response.waiting.is_set)
+                    self.right_click_app(key, cancel_for="Install").buttons["Install"].invoke()
+                finally:
+                    response.resume.set()
+                    self.wait_until_idle()
+            launch.assert_not_called()
+
+    def test_install_local_file(self):
+        path = self.ui.catalog / "local.json"
+        for name, enabled in (("setup.exe", True), ("download.zip", False)):
+            package = self.ui.catalog / name
+            package.touch()
+            path.write_text(json.dumps({"id": "local", "local_path": name}))
+            self.ui.reload()
+            self.ui.select_view("local")
+            button = self.right_click_app(str(path)).buttons["Install"]
+            self.assertTrue(button.instate(["!disabled" if enabled else "disabled"]))
+            if enabled:
+                with patch("shelf_window.os.startfile", side_effect=OSError("Launch failed"), create=True) as launch:
+                    button.invoke()
+                    launch.assert_called_once_with(package, cwd=package.parent)
+                    self.assertIn("Launch failed", self.ui.status.get())
+            self.ui.app_menu.dismiss()
+
     def test_disable_and_enable_from_sidebar(self):
         ui = self.ui
         first, second = self.keys
@@ -193,16 +280,46 @@ class DesktopTest(unittest.TestCase):
         path = self.ui.catalog / "local.json"
         path.write_text(json.dumps({"id": "local", "local_path": "missing"}))
         self.ui.reload()
-        self.ui.nav_buttons["local"].invoke()
+        self.assertEqual(self.ui.tree.get_children(), self.keys)
+        self.assertEqual(self.ui.view_counts["all"].get(), "2")
+        self.assertEqual(self.ui.page_title.get(), "Tracked")
+        nav = self.ui.nav_buttons
+        self.assertEqual(int(nav["local"].grid_info()["row"]), int(nav["all"].grid_info()["row"]) + 1)
+        nav["attention"].invoke()
+        self.assertIn(str(path), self.ui.tree.get_children())
+        nav["local"].invoke()
         self.assertEqual(self.ui.tree.get_children(), (str(path),))
         self.assertEqual(self.ui.view_counts["local"].get(), "1")
         self.assertEqual(self.ui.tree.set(str(path), "Status"), "Error")
         self.assertTrue(self.right_click_app(str(path)).buttons["Disable updates"].instate(["disabled"]))
 
+    def test_tracked_examples_open_and_save_in_a_local_only_catalog(self):
+        for key in self.keys:
+            Path(key).unlink()
+        local = self.ui.catalog / "local.json"
+        local.write_text(json.dumps({"id": "local", "local_path": "."}))
+        self.ui.reload()
+        self.root.deiconify()
+        self.root.update()
+        self.assertTrue(self.ui.example_choices.winfo_viewable())
+        buttons = self.ui.example_choices.winfo_children()
+        self.assertEqual([b.cget("text") for b in buttons], ["Process Explorer", "Autoruns"])
+        buttons[0].invoke()
+        self.assertEqual(self.ui.editor.fields["id"].get(), "process-explorer")
+        self.ui.editor.cancel_button.invoke()
+        self.assertEqual(list(self.ui.catalog.glob("*.json")), [local])
+        buttons[1].invoke()
+        self.ui.editor.save_button.invoke()
+        key, = self.ui.tree.get_children()
+        self.assertEqual(self.ui.tree.set(key, "Name"), "Autoruns")
+        self.assertEqual(self.ui.jobs[key].download, "https://download.sysinternals.com/files/Autoruns.zip")
+        self.assertEqual(self.ui.view_counts["local"].get(), "1")
+
     def test_local_item_opens_folder_and_edits_without_enabling_updates(self):
         path = self.ui.catalog / "local.json"
         path.write_text(json.dumps({"id": "local", "category": "Hardware", "local_path": "."}))
         self.ui.reload(saved=str(path))
+        self.ui.select_view("local")
         key = str(path)
         self.assertEqual(self.ui.tree.set(key, "Status"), "Local only")
         with patch("shelf_window.os.startfile", create=True) as launch:
@@ -269,9 +386,7 @@ class DesktopTest(unittest.TestCase):
                 self.assertEqual(options.language_button.cget("text"), native)
                 self.assertEqual(read_language(self.ui.language_file), code)
                 self.assertEqual(options.language_heading.cget("text"), tr("Language"))
-                self.assertEqual(self.ui.page_title.get(), tr("Catalog"))
-                if code != "en":
-                    self.assertNotEqual(self.ui.page_title.get(), "Catalog")
+                self.assertEqual(self.ui.page_title.get(), tr("Tracked"))
                 self.assertEqual(self.ui.tree.heading("Name", "text"), tr("Name"))
                 self.assertEqual(self.ui.column_menu.buttons["Item icon"].cget("text"), tr("Item icon"))
                 self.assertEqual(self.ui.tree.get_children(), (key,))
@@ -291,7 +406,7 @@ class DesktopTest(unittest.TestCase):
         second = tk.Toplevel(self.root)
         self.addCleanup(second.destroy)
         reopened = ShelfWindow(second, self.ui.catalog, self.dest, self.ui.targets, appearance_file=self.appearance)
-        self.assertEqual(reopened.page_title.get(), catalog("ur")["Catalog"])
+        self.assertEqual(reopened.page_title.get(), catalog("ur")["Tracked"])
         reopened.options_button.invoke()
         self.assertEqual(reopened.options.language_button.cget("text"), "اردو")
 
@@ -606,7 +721,7 @@ class DesktopTest(unittest.TestCase):
         self.wait_until_idle()
         self.assertFalse(menu.winfo_viewable())
         self.assertEqual(self.ui.results[second].status, "Repair needed")
-        self.assertEqual(self.ui.results[first].status, "Not checked")
+        self.assertEqual(self.ui.results[first].status, "Unknown")
 
     def test_delete_local_file_scope_and_confirmation(self):
         path = self.ui.catalog / "local.json"
@@ -620,21 +735,58 @@ class DesktopTest(unittest.TestCase):
                 settings.write_text("settings")
                 path.write_text(json.dumps({"id": "local", "local_path": str(app)}))
                 self.ui.reload()
-                with patch("shelf_window.messagebox.askyesno", return_value=False) as confirm:
+                self.ui.select_view("local")
+                with patch("shelf_window.deletion_dialog", return_value=False) as confirm:
                     self.right_click_app(str(path)).buttons[mode].invoke()
                     self.assertTrue(path.exists() and app.exists() and settings.exists())
-                    self.assertEqual(confirm.call_args.kwargs["default"], "no")
                     if mode != DELETE:
                         expected = folder if mode == FOLDER else app
-                        self.assertIn(str(expected), confirm.call_args.kwargs["detail"].splitlines())
-                with patch("shelf_window.messagebox.askyesno", return_value=True):
+                        self.assertIn(expected, confirm.call_args.args[-1])
+                with patch("shelf_window.deletion_dialog", return_value=True):
                     self.right_click_app(str(path)).buttons[mode].invoke()
                 self.assertNotIn(str(path), self.ui.jobs)
                 self.assertFalse(path.exists())
                 self.assertEqual(app.exists(), mode == DELETE)
                 self.assertEqual(settings.exists(), mode != FOLDER)
                 self.assertEqual(folder.exists(), mode != FOLDER)
-                self.assertEqual(set(self.ui.tree.get_children()), set(self.keys))
+                self.assertEqual(self.ui.tree.get_children(), ())
+
+    def test_delete_dialog_actions_and_safe_default(self):
+        self.root.deiconify()
+        self.root.update()
+        paths = [Path("folder") / f"file-{i}.txt" for i in range(30)]
+        for action in ("Return", "Escape", FOLDER):
+            observed = {}
+
+            def choose():
+                dialog = self.root.grab_current()
+                buttons = {w.cget("text"): w for w in descendants(dialog) if isinstance(w, ttk.Button)}
+                listing = next(w for w in descendants(dialog) if isinstance(w, tk.Text))
+                # The private desktop may have no active window. Check which control
+                # receives focus on activation before sending a keyboard event.
+                observed["focus"] = dialog.focus_lastfor()
+                observed["cancel"] = buttons["Cancel"]
+                observed["icons"] = all(w.cget("image") for w in buttons.values())
+                observed["paths"] = listing.get("1.0", "end-1c").splitlines()
+                if action == FOLDER:
+                    buttons[action].invoke()
+                else:
+                    buttons["Cancel"].focus_force()
+                    buttons["Cancel"].event_generate(f"<{action}>")
+
+            def timeout_close():
+                observed["timeout"] = True
+                self.root.grab_current().destroy()
+
+            self.root.after(100, choose)
+            timeout = self.root.after(5000, timeout_close)
+            confirmed = deletion_dialog(self.root, self.ui.palette, FOLDER, "Sample", "Files", paths)
+            self.root.after_cancel(timeout)
+            self.assertNotIn("timeout", observed)
+            self.assertEqual(confirmed, action == FOLDER)
+            self.assertIs(observed["focus"], observed["cancel"])
+            self.assertTrue(observed["icons"])
+            self.assertEqual(observed["paths"], list(map(str, paths)))
 
     def test_delete_download_separates_payload_and_settings(self):
         path = Path(self.keys[0])
@@ -659,7 +811,7 @@ class DesktopTest(unittest.TestCase):
                     "published": {"path": str(live / "tool.exe"), "stats": hashes, "companions": ["manual.txt"]}}
         (root / "current.json").write_text(json.dumps(manifest))
         self.ui.reload()
-        with patch("shelf_window.messagebox.askyesno", return_value=True):
+        with patch("shelf_window.deletion_dialog", return_value=True):
             self.right_click_app(str(path)).buttons[DATA].invoke()
         self.assertFalse(path.exists() or saved.exists() or (root / "current.json").exists())
         self.assertEqual({p.name for p in live.iterdir()}, {"settings.ini", "manual.txt", "user.log"})
@@ -669,12 +821,15 @@ class DesktopTest(unittest.TestCase):
         path = Path(self.keys[0])
 
         def replace(*args, **kwargs):
+            if kwargs.get("blocked"):
+                return False
             path.write_text(json.dumps({"id": "replacement", "local_path": str(self.dest)}))
             return True
 
-        with patch("shelf_window.messagebox.askyesno", side_effect=replace):
+        with patch("shelf_window.deletion_dialog", side_effect=replace):
             self.right_click_app(str(path)).buttons[DELETE].invoke()
         self.assertEqual(json.loads(path.read_text())["id"], "replacement")
+        self.assertEqual(self.ui.jobs[str(path)].id, "replacement")
 
     def test_external_download_folder_and_retry_after_locked_file(self):
         path = Path(self.keys[0])
@@ -702,6 +857,42 @@ class DesktopTest(unittest.TestCase):
         delete_item(FOLDER, path, job, original, full, self.dest, targets)
         self.assertFalse(app.parent.exists() or path.exists() or manifest.exists())
         self.assertEqual(json.loads(targets.read_text()), {job.id: str(app)})
+
+    def test_delete_with_data_opens_a_dialog_for_local_folders_and_files(self):
+        path = Path(self.keys[0])
+        folder = self.dest.parent / "portable"
+        folder.mkdir()
+        payload = folder / "tool.exe"
+        payload.touch()
+        for target in (folder, payload):
+            path.write_text(json.dumps({"id": "local", "local_path": str(target)}))
+            self.ui.reload()
+            self.ui.select_view("local")
+            menu = self.right_click_app(str(path))
+
+            observed = {}
+
+            def dismiss(dialog):
+                widgets = list(descendants(dialog))
+                buttons = {w.cget("text"): w for w in widgets if isinstance(w, ttk.Button)}
+                observed.update(title=dialog.title(), modal=dialog.grab_current() == dialog,
+                                buttons=set(buttons), icons=all(b.cget("image") for b in buttons.values()),
+                                labels=[w.cget("text") for w in widgets if isinstance(w, ttk.Label)],
+                                lists=[w.get("1.0", "end-1c").splitlines() for w in widgets if isinstance(w, tk.Text)])
+                buttons["Close" if target == folder else "Cancel"].invoke()
+
+            with patch.object(self.root, "wait_window", side_effect=dismiss) as wait:
+                menu.buttons[DATA].invoke()
+                wait.assert_called_once()
+            self.assertEqual(observed["title"], DATA)
+            self.assertTrue(observed["modal"] and observed["icons"])
+            if target == folder:
+                self.assertEqual(observed["buttons"], {"Close"})
+                self.assertIn("Use Delete entire app folder to remove a local folder.", observed["labels"])
+            else:
+                self.assertEqual(observed["buttons"], {"Cancel", DATA})
+                self.assertIn(str(payload), observed["lists"][0])
+            self.assertTrue(payload.exists() and path.exists())
 
     def test_local_folder_deletion_requires_the_folder_command(self):
         path = Path(self.keys[0])
@@ -740,13 +931,13 @@ class DesktopTest(unittest.TestCase):
         self.root.update()
         self.assertTrue(menu.winfo_viewable())
         self.assert_dropdown_join(trigger, menu, below=True)
-        self.assertEqual(tuple(menu.buttons), ("Verify all items", "Reload catalog"))
+        self.assertEqual(tuple(menu.buttons), ("Reload", "Verify all items"))
         row_style = self.ui.app_menu.buttons["Edit item"].cget("style")
         for button in menu.buttons.values():
             self.assertEqual(button.cget("style"), row_style)
             self.assertEqual(str(button.cget("compound")), "left")
             self.assertIn(button.cget("image")[0], self.root.image_names())
-        menu.buttons["Reload catalog"].invoke()
+        menu.buttons["Reload"].invoke()
         self.root.update()
         self.assertFalse(menu.winfo_viewable())
         self.assertTrue(trigger.instate(["!selected"]))
@@ -756,9 +947,19 @@ class DesktopTest(unittest.TestCase):
         self.root.update()
         self.assertTrue(menu.winfo_viewable())
         self.assert_dropdown_join(trigger, menu, below=False)
-        first = menu.buttons["Verify all items"]
+        first = menu.buttons["Reload"]
+        second = menu.buttons["Verify all items"]
         self.assertIs(self.root.focus_get(), first)
-        first.event_generate("<Escape>")
+        px, py = trigger.winfo_pointerxy()
+        # Tk can send crossing and motion events as the popup appears under a still pointer.
+        for sequence in ("<Enter>", "<Motion>", "<Leave>"):
+            second.event_generate(sequence, rootx=px, rooty=py)
+            self.root.update()
+            self.assertIs(self.root.focus_get(), first)
+        second.event_generate("<Motion>", rootx=px + 1, rooty=py)
+        self.root.update()
+        self.assertIs(self.root.focus_get(), second)
+        second.event_generate("<Escape>")
         self.root.update()
         self.assertFalse(menu.winfo_viewable())
         self.assertTrue(trigger.instate(["!selected"]))
@@ -827,14 +1028,14 @@ class DesktopTest(unittest.TestCase):
         self.wait_until_idle()
         self.assertEqual(tree.set(alpha, "Status"), "Repair needed")
         self.click_header("Status")
-        self.assertEqual(tree.get_children(), (beta, alpha))
-        self.click_header("Status")
         self.assertEqual(tree.get_children(), (alpha, beta))
-        with patch("shelf_window.execute", return_value=Result("Latest")):
+        self.click_header("Status")
+        self.assertEqual(tree.get_children(), (beta, alpha))
+        with patch("shelf_window.execute", return_value=Result("Update available")):
             self.ui.start("check", key=alpha)
             self.wait_until_idle()
-        self.assertEqual(tree.set(alpha, "Status"), "Latest")
-        self.assertEqual(tree.get_children(), (beta, alpha))
+        self.assertEqual(tree.set(alpha, "Status"), "Update available")
+        self.assertEqual(tree.get_children(), (alpha, beta))
 
     def test_header_menu_hides_and_restores_a_column_even_in_an_empty_view(self):
         self.root.deiconify()
@@ -1065,6 +1266,34 @@ class DesktopTest(unittest.TestCase):
         self.assertEqual(tree.set(str(path), "Name"), name)
         self.assertEqual(ui.name(str(path)), name)
 
+    def test_hover_reveals_only_clipped_text_in_the_displayed_column(self):
+        self.root.geometry("760x430")
+        self.root.deiconify()
+        tree = self.ui.tree
+        tree.configure(displaycolumns=("Status", "Name"))
+        self.root.update()
+        row = self.keys[0]
+        name = "Very long application name " * 10
+        values = list(tree.rows[row])
+        values[tree["columns"].index("Name")] = name
+        tree.set_values(row, values)
+        caption = "A very long heading " * 10
+        tree.set_caption("Name", caption, " ^")
+        x, y, width, height = tree.bbox(row, "Name")
+        x += width // 2
+        self.assertEqual(tree.clipped_text_at(x, 5), caption + " ^")
+        tree.event_generate("<Motion>", x=x, y=y + height // 2)
+        self.root.after(650, self.root.quit)
+        self.root.mainloop()
+        tips = [w for w in self.root.winfo_children()
+                if isinstance(w, ttk.Label) and w.winfo_ismapped()]
+        self.assertEqual([w["text"] for w in tips], [name])
+        tree.event_generate("<Leave>")
+        self.assertFalse(tips[0].winfo_exists())
+        values[tree["columns"].index("Name")] = "Done..."
+        tree.set_values(row, values)
+        self.assertIsNone(tree.clipped_text_at(x, y + height // 2))
+
     def test_last_visible_column_can_restore_others_after_restart(self):
         tree = self.ui.tree
         columns = tree["columns"]
@@ -1111,11 +1340,33 @@ class DesktopTest(unittest.TestCase):
                     width, height = title.winfo_width(), title.winfo_height()
                     button = self.ui.nav_buttons[view]
                     button.invoke()
-                    self.assertEqual(title.cget("text"), button.cget("text"))
-                    self.assertGreaterEqual(width, title.winfo_reqwidth())
-                    self.assertGreaterEqual(height, title.winfo_reqheight())
+                    self.assertEqual(title.full_text, button.cget("text"))
+                    displayed = title.cget("text")
+                    if displayed != title.full_text:
+                        self.assertTrue(displayed.endswith("..."))
+                        self.assertTrue(title.full_text.startswith(displayed[:-3]))
+                    self.assertEqual(title.master.winfo_height(), title.winfo_reqheight())
                     self.root.update_idletasks()
                     self.assertEqual((title.winfo_width(), title.winfo_height()), (width, height))
+
+    def test_category_header_stays_one_line_when_resized(self):
+        category = "OS Setup and Recovery"
+        path = Path(self.keys[0])
+        recipe = json.loads(path.read_text())
+        path.write_text(json.dumps({**recipe, "category": category}))
+        self.ui.reload()
+        self.root.deiconify()
+        self.ui.select_view(f"category:{category}")
+        title = self.ui.title_label
+        for width in (1400, 760, 1400):
+            self.root.geometry(f"{width}x680")
+            self.root.update()
+            if width == 760:
+                self.assertTrue(title.cget("text").endswith("..."))
+                self.assertEqual(title.master.winfo_height(), full_height)
+            else:
+                self.assertEqual(title.cget("text"), category)
+                full_height = title.master.winfo_height()
 
     def test_sidebar_toggle_sits_beside_options_and_stacks_above_when_collapsed(self):
         self.root.deiconify()
@@ -1141,14 +1392,15 @@ class DesktopTest(unittest.TestCase):
                 self.assertEqual(toggle.winfo_rootx(), options.winfo_rootx())
                 self.assertEqual(right_edge(toggle), right_edge(options))
                 gap = options.winfo_rooty() - (toggle.winfo_rooty() + toggle.winfo_height())
-                self.assertGreaterEqual(gap, 0)
-                self.assertLess(gap, toggle.winfo_height())
+                checklist = self.ui.nav_buttons["checklist"]
+                nav_gap = all_apps.winfo_rooty() - (checklist.winfo_rooty() + checklist.winfo_height())
+                self.assertEqual(gap, nav_gap)
 
                 toggle.invoke()
                 self.root.update()
                 self.assertEqual((options.winfo_geometry(), toggle.winfo_geometry()), expanded)
 
-    def test_options_follows_last_category_row_after_scrolling_and_resizing(self):
+    def test_options_centers_below_category_rows_after_toggle_scroll_or_resize(self):
         self.root.deiconify()
         listing = self.ui.category_list
         recipe = json.loads(Path(self.keys[0]).read_text())
@@ -1161,17 +1413,28 @@ class DesktopTest(unittest.TestCase):
                 with self.subTest(categories=count, height=height):
                     self.root.geometry(f"1120x{height}")
                     self.root.update()
+                    options = self.ui.options_button
+                    header = self.ui.categories_button
+                    header.invoke()
+                    self.root.update()
+                    self.assertFalse(listing.winfo_viewable())
+                    rail = self.ui.sidebar_body.master
+                    rail_bottom = rail.winfo_rooty() + rail.winfo_height()
+                    self.assertEqual(rail_bottom - options.winfo_rooty() - options.winfo_height(), 4)
+                    header.invoke()
+                    self.root.update()
+                    self.assertTrue(listing.winfo_viewable())
                     listing.yview_moveto(1)
                     self.root.update()
                     last = listing.get_children()[-1]
                     _, y, _, h = listing.bbox(last)
                     bottom = y + h
                     self.assertEqual(bottom, listing.winfo_height())
-                    options = self.ui.options_button
-                    gap = options.winfo_rooty() - (listing.winfo_rooty() + bottom)
-                    self.assertIn(gap, range(5))
-                    self.assertLessEqual(options.winfo_rooty() + options.winfo_height(),
-                                         self.root.winfo_rooty() + self.root.winfo_height())
+                    gap_above = options.winfo_rooty() - (listing.winfo_rooty() + bottom)
+                    gap_below = rail_bottom - (options.winfo_rooty() + options.winfo_height())
+                    self.assertEqual(listing.winfo_rooty() - (header.winfo_rooty() + header.winfo_height()), 2)
+                    self.assertGreaterEqual(gap_above, 4)
+                    self.assertLessEqual(abs(gap_above - gap_below), 1)
                     self.assert_scrollbar_visible(listing, count == 24)
 
     def test_category_count_column_grows_for_two_digits(self):
@@ -1189,6 +1452,36 @@ class DesktopTest(unittest.TestCase):
         x, _, width, _ = listing.bbox(category, "count")
         self.assertGreater(width, initial_width)
         self.assertLessEqual(x + width, listing.winfo_width())
+
+        recipe.update(id="long-category", category="A long category name " * 4)
+        (self.ui.catalog / "long-category.json").write_text(json.dumps(recipe))
+        self.ui.reload()
+        self.root.update()
+        self.assertEqual(listing.xview(), (0.0, 1.0))
+        x, _, width, _ = listing.bbox(category, "count")
+        self.assertEqual(x + width, listing.winfo_width())
+
+    def test_category_picker_shares_one_outline_in_both_directions(self):
+        window = tk.Toplevel(self.root)
+        window.overrideredirect(True)
+        field = category_picker(window, tk.StringVar(window), tuple(range(12)), width=36)
+        field.pack()
+        call = field.tk.call
+        popup = f"{field}.popdown"
+        for below, y in ((True, 100), (False, window.winfo_screenheight() - 100)):
+            with self.subTest(below=below):
+                window.geometry(f"+100+{y}")
+                window.update()
+                field.event_generate("<ButtonPress-1>", x=field.winfo_width() - 15, y=12)
+                window.update()
+                popup_y = call("winfo", "rooty", popup)
+                height = call("winfo", "height", popup)
+                self.assertEqual(popup_y if below else popup_y + height - 1,
+                                 field.winfo_rooty() + (field.winfo_height() - 1 if below else 0))
+                self.assertEqual(call("winfo", "width", popup), field.winfo_width())
+                self.assertEqual(call("winfo", "rooty", f"{popup}.f") - popup_y, 0 if below else 1)
+                call("ttk::combobox::Unpost", field)
+                window.update()
 
     def test_edit_item_category_picker_lists_catalog_and_accepts_new_names(self):
         first, second = map(Path, self.keys)
@@ -1276,6 +1569,54 @@ class DesktopTest(unittest.TestCase):
             change_category(self.ui.catalog, members, "", "Tools", rename=True)
         self.assertEqual(originals, {path: path.read_bytes() for path in paths})
 
+    def test_main_window_restores_size_and_position_on_reopen(self):
+        def reopen():
+            window = tk.Toplevel(self.root)
+            ui = ShelfWindow(window, self.ui.catalog, self.dest, self.ui.targets, appearance_file=self.appearance)
+            window.update()
+            return ui
+
+        ui = reopen()
+        geometry = "870x510+81+72"
+        ui.root.geometry(geometry)
+        ui.root.update()
+        ui.close()
+        ui = reopen()
+        self.assertEqual(ui.root.geometry(), geometry)
+        if sys.platform == "win32":
+            ui.root.state("zoomed")
+            ui.root.update()
+            ui.close()
+            ui = reopen()
+            self.assertEqual(ui.root.state(), "zoomed")
+            ui.root.state("normal")
+            ui.root.update()
+            self.assertEqual(ui.root.geometry(), geometry)
+        ui.close()
+
+    def test_category_expansion_survives_restart(self):
+        ui = self.ui
+        self.root.deiconify()
+        self.root.update()
+        self.assertTrue(ui.category_list.winfo_viewable())
+        for expanded, angle in ((False, 90), (True, 0)):
+            if expanded:
+                ui.sidebar_toggle.invoke()
+                ui.categories_button.invoke()
+            else:
+                ui.categories_arrow.event_generate("<ButtonPress-1>", x=5, y=5)
+                ui.categories_arrow.event_generate("<ButtonRelease-1>", x=5, y=5)
+            window = tk.Toplevel(self.root)
+            self.addCleanup(window.destroy)
+            ui = ShelfWindow(window, ui.catalog, self.dest, ui.targets, appearance_file=self.appearance)
+            self.root.update()
+            self.assertEqual(bool(ui.category_list.winfo_viewable()), expanded)
+            self.assertEqual(ui.categories_button.cget("text"), tr("Categories"))
+            arrow = ui.categories_arrow
+            self.assertEqual(arrow.itemcget(ui.arrow_glyph, "text"), "▼")
+            self.assertEqual(float(arrow.itemcget(ui.arrow_glyph, "angle")), angle)
+            self.assertEqual(arrow.itemcget(ui.arrow_glyph, "font"), ui.style.lookup("Treeview.Heading", "font"))
+
     def test_sidebar_categories_filter_search_and_follow_catalog_changes(self):
         ui = self.ui
         first, second = self.keys
@@ -1286,17 +1627,43 @@ class DesktopTest(unittest.TestCase):
         ui.reload()
         self.root.deiconify()
         self.root.update()
+        # This test checks the full category captions in the resizable sidebar.
+        ui.panes.sash_place(0, 300, 0)
+        self.root.update()
         listing = ui.category_list
         hardware, unassigned = listing.get_children()
         self.assertEqual(listing.set(hardware, "name"), "Hardware")
         self.assertEqual(listing.set(hardware, "count"), "1")
         self.assertEqual(listing.set(unassigned, "name"), "Uncategorized")
-        x, y, width, height = listing.bbox(hardware, "name")
+        self.assertEqual(listing.item(hardware, "tags"), ("cpu",))
+        self.assertEqual(listing.item(unassigned, "tags"), ("inbox",))
+        self.assertTrue(listing.tag_configure("cpu", "image"))
+        x, y, width, height = listing.bbox(hardware, "#0")
         listing.event_generate("<ButtonPress-1>", x=x + width // 2, y=y + height // 2)
         listing.event_generate("<ButtonRelease-1>", x=x + width // 2, y=y + height // 2)
         self.root.update()
         self.assertEqual(ui.tree.get_children(), (first,))
         self.assertEqual(ui.page_title.get(), "Hardware")
+        self.assertEqual(ui.icon_widgets[ui.title_icon][0], "cpu")
+        header = ui.categories_button
+        local = ui.nav_buttons["local"]
+        self.assertEqual(header.cget("style"), local.cget("style"))
+        self.assertEqual(header.winfo_height(), local.winfo_reqheight())
+        last_nav = [button for button in ui.nav_buttons.values() if button.winfo_viewable()][-1]
+        self.assertEqual(header.winfo_rooty(), last_nav.winfo_rooty() + last_nav.winfo_height() + 4)
+        header_position = (header.winfo_rootx(), header.winfo_rooty())
+        self.assertGreater(listing.winfo_rootx(), header.winfo_rootx())
+        header.invoke()
+        ui.refresh_categories()
+        self.root.update()
+        self.assertFalse(listing.winfo_viewable())
+        self.assertEqual((header.winfo_rootx(), header.winfo_rooty()), header_position)
+        self.assertEqual(ui.view.get(), hardware)
+        header.invoke()
+        self.root.update()
+        self.assertTrue(listing.winfo_viewable())
+        self.assertEqual((header.winfo_rootx(), header.winfo_rooty()), header_position)
+        self.assertEqual(listing.selection(), (hardware,))
         ui.search.set("beta")
         self.assertFalse(ui.tree.get_children())
         self.assertEqual(ui.empty_title.get(), "No matching items")
@@ -1353,6 +1720,61 @@ class DesktopTest(unittest.TestCase):
         self.assertTrue(count.instate(["selected", "!pressed"]))
         self.assertEqual(background(count), background(button))
 
+    def test_sidebar_drag_resizes_app_list_and_survives_collapse(self):
+        self.root.deiconify()
+        self.root.geometry("1120x680")
+        self.root.update()
+        panes, sidebar = self.ui.panes, self.ui.sidebar
+
+        def drag(distance):
+            x, y = panes.sash_coord(0)
+            y += 20
+            panes.event_generate("<ButtonPress-1>", x=x, y=y)
+            panes.event_generate("<B1-Motion>", x=x + distance, y=y)
+            panes.event_generate("<ButtonRelease-1>", x=x + distance, y=y)
+            self.root.update()
+
+        def reopen():
+            window = tk.Toplevel(self.root)
+            self.addCleanup(window.destroy)
+            ui = ShelfWindow(window, self.ui.catalog, self.dest, self.ui.targets, appearance_file=self.appearance)
+            self.root.update()
+            return ui
+
+        self.assertEqual(int(panes.cget("sashwidth")), 1)
+        old_width = sidebar.winfo_width()
+        old_list_width = self.ui.tree.winfo_width()
+        grip = self.ui.sidebar_grip
+        grip.event_generate("<ButtonPress-1>", x=2, y=20)
+        grip.event_generate("<B1-Motion>", x=102, y=20)
+        grip.event_generate("<ButtonRelease-1>", x=102, y=20)
+        self.root.update()
+        self.assertGreater(sidebar.winfo_width(), old_width)
+        self.assertLess(self.ui.tree.winfo_width(), old_list_width)
+        expanded_width = sidebar.winfo_width()
+        reopened = reopen()
+        self.assertFalse(reopened.sidebar_compact)
+        self.assertEqual(reopened.sidebar.winfo_width(), expanded_width)
+        self.ui.sidebar_toggle.invoke()
+        self.root.update()
+        self.assertLess(sidebar.winfo_width(), old_width)
+        reopened = reopen()
+        self.assertTrue(reopened.sidebar_compact)
+        self.assertEqual(reopened.sidebar.winfo_width(), sidebar.winfo_width())
+        reopened.sidebar_toggle.invoke()
+        self.root.update()
+        self.assertEqual(reopened.sidebar.winfo_width(), expanded_width)
+        self.ui.sidebar_toggle.invoke()
+        self.root.update()
+        self.assertEqual(sidebar.winfo_width(), expanded_width)
+        self.root.geometry("760x430")
+        self.root.update()
+        drag(1000)
+        self.assertGreaterEqual(self.ui.table_area.master.winfo_width(), 440)
+        drag(-1000)
+        self.assertEqual(sidebar.winfo_width(), 150)
+        self.assertEqual(reopen().sidebar.winfo_width(), 150)
+
     def test_sidebar_toggle_reclaims_space_and_restores_labels_and_counts(self):
         self.root.deiconify()
         self.ui.results[self.keys[1]] = Result("Pending")
@@ -1404,6 +1826,7 @@ class DesktopTest(unittest.TestCase):
             tree.event_generate("<Shift-F10>")
             popup.assert_not_called()
 
+            self.ui.select_view("attention")
             tree.selection_set(invalid)
             tree.event_generate("<Shift-F10>")
             popup.assert_called_once()
@@ -1414,6 +1837,7 @@ class DesktopTest(unittest.TestCase):
                 menu.buttons["Edit item"].invoke()
                 edit.assert_called_once_with(Path(invalid))
 
+            self.ui.select_view("all")
             tree.selection_set(valid)
             self.ui.busy = True
             tree.event_generate("<Shift-F10>")
@@ -1593,14 +2017,14 @@ class DesktopTest(unittest.TestCase):
                 self.assertNotIn(str(self.dest / "alpha"), widget.get("1.0", "end"))
         editor = self.edit_selected()
         tabs = next(w for w in descendants(editor) if isinstance(w, ttk.Notebook))
-        self.assertEqual(tabs.tab(tabs.select(), "text"), "Catalog")
+        self.assertEqual(tabs.tab(tabs.select(), "text"), "General")
         self.assertEqual([tabs.tab(tab, "text") for tab in tabs.tabs()],
-                         ["Catalog", "Download options", "Source", "Item info"])
+                         ["General", "Download options", "Source", "Item info"])
         self.assertEqual({button.cget("text") for button in editor.buttons.values()}, labels)
         detail = editor.detail.get("1.0", "end")
         self.assertIn("https://publisher.example", detail)
         self.assertIn(str(self.dest / "alpha"), detail)
-        self.assertIn("Not checked", detail)
+        self.assertIn("Unknown", detail)
         self.assertEqual(str(editor.detail.cget("state")), "disabled")
 
     def test_editor_save_and_cancel_share_size_for_long_labels(self):
@@ -1626,6 +2050,31 @@ class DesktopTest(unittest.TestCase):
         if visible:
             self.assertEqual(bar.get(), widget.yview() if orient == "vertical" else widget.xview())
         return bar
+
+    def test_app_table_ends_at_last_row_after_scrolling_filtering_and_resizing(self):
+        recipe = json.loads(Path(self.keys[0]).read_text())
+        for number in range(24):
+            recipe["id"] = f"tool-{number}"
+            (self.ui.catalog / f"tool-{number}.json").write_text(json.dumps(recipe))
+        self.ui.reload()
+        self.root.deiconify()
+        tree = self.ui.tree
+        card = tree.master.master
+        for size, query in (("1120x680", ""), ("760x430", ""), ("1120x800", ""),
+                            ("1120x800", "tool-23"), ("1120x800", "")):
+            with self.subTest(size=size, query=query):
+                self.root.geometry(size)
+                self.ui.search.set(query)
+                self.root.update()
+                tree.yview_moveto(1)
+                self.root.update()
+                _, y, _, height = tree.bbox(tree.get_children()[-1])
+                self.assertEqual(y + height, tree.winfo_height())
+                self.assert_scrollbar_visible(tree, not query)
+                if query:
+                    self.assertEqual(height, int(self.ui.style.lookup("Treeview", "rowheight")))
+                else:
+                    self.assertLess(self.ui.table_area.winfo_height() - card.winfo_height(), int(tree["height"]))
 
     def test_scrollbar_alignment_and_visibility_on_resize(self):
         self.root.deiconify()
@@ -1654,6 +2103,7 @@ class DesktopTest(unittest.TestCase):
                 if tab_name == "Recipe JSON":
                     Path(self.keys[0]).write_text("{")
                     self.ui.reload()
+                    self.ui.select_view("attention")
                 editor = self.edit_selected()
                 tabs = next(w for w in descendants(editor) if isinstance(w, ttk.Notebook))
                 tabs.select(next(tab for tab in tabs.tabs() if tabs.tab(tab, "text") == tab_name))
@@ -1679,7 +2129,7 @@ class DesktopTest(unittest.TestCase):
             page.assert_called_once()
             self.assertFalse(self.dest.exists())
             self.assertEqual([self.ui.results[k].status for k in self.keys],
-                             ["Update available", "Not checked"])
+                             ["Update available", "Unknown"])
             self.assertIn("Update available", editor.detail.get("1.0", "end"))
             reply = io.BytesIO(b"fixture")
             reply.headers = {"Content-Length": "7"}
@@ -1691,7 +2141,7 @@ class DesktopTest(unittest.TestCase):
         with patch("fetch_sources.open_url") as network:
             self.click(editor.buttons["verify"])
             self.assertIn("SHA-256 mismatch", editor.detail.get("1.0", "end"))
-            self.assertEqual(self.ui.results[self.keys[1]].status, "Not checked")
+            self.assertEqual(self.ui.results[self.keys[1]].status, "Unknown")
             editor.destroy()
             self.ui.more_menu.buttons["Verify all items"].invoke()
             self.wait_until_idle()
@@ -1905,6 +2355,28 @@ class DesktopTest(unittest.TestCase):
         self.assertFalse((self.dest / "alpha" / "current" / "alpha.bin").exists())
         self.assertFalse(editor.buttons["fetch"].instate(["disabled"]))
 
+    def test_source_error_highlight_follows_theme_and_clears_after_retry(self):
+        editor = self.edit_selected("Item info")
+        row = self.keys[0]
+        with patch("fetch_sources.read_page", return_value="missing version"):
+            self.click(editor.buttons["check"])
+        self.assertEqual(self.ui.results[row].status, "Source error")
+        self.assertTrue(self.ui.tree.tag_has("error", row))
+        start, end = editor.detail.tag_ranges("error")
+        self.assertEqual(editor.detail.get(start, end).strip(), tr(self.ui.results[row].detail))
+
+        for mode in ("Dark", "Light"):
+            self.ui.mode.set(mode)
+            self.ui.refresh_theme()
+            color = self.ui.palette.error
+            self.assertEqual(str(self.ui.tree.tag_configure("error", "foreground")), color)
+            self.assertEqual(editor.detail.tag_cget("error", "foreground"), color)
+
+        with patch("fetch_sources.read_page", return_value="1"):
+            self.click(editor.buttons["check"])
+        self.assertFalse(self.ui.tree.tag_has("error", row))
+        self.assertFalse(editor.detail.tag_ranges("error"))
+
     def test_editor_drafts_and_closing_during_a_check(self):
         editor = self.edit_selected()
         path = Path(self.keys[0])
@@ -1940,7 +2412,7 @@ class DesktopTest(unittest.TestCase):
             self.assertTrue(self.ui.all_buttons["check"].instate(["!disabled"]))
             for button in (self.ui.all_buttons["fetch"], self.ui.edit_button):
                 self.assertTrue(button.instate(["disabled"]))
-            for label in ("Verify all items", "Reload catalog"):
+            for label in ("Reload", "Verify all items"):
                 self.assertTrue(self.ui.more_menu.buttons[label].instate(["disabled"]))
             self.wait_until_idle()
             self.assertEqual(page.call_count, 2)
@@ -1953,7 +2425,7 @@ class DesktopTest(unittest.TestCase):
         self.root.deiconify()
         self.root.update()
         previous = self.ui.results.copy()
-        for action, label in (("check", "Check for updates"), ("fetch", "Update all items")):
+        for action, label in (("check", "Check all items"), ("fetch", "Update all items")):
             with self.subTest(action=action):
                 publisher = GatedPage()
                 with (patch("fetch_sources.read_page", side_effect=publisher) as page,
@@ -1989,7 +2461,7 @@ class DesktopTest(unittest.TestCase):
         self.ui.change_language("fr")
         self.root.update()
         trigger, menu = self.ui.more_button, self.ui.more_menu
-        verify, reload_apps = menu.buttons["Verify all items"], menu.buttons["Reload catalog"]
+        verify, reload_apps = menu.buttons["Verify all items"], menu.buttons["Reload"]
         trigger.invoke()
         self.root.update()
         self.assertTrue(menu.winfo_viewable())
@@ -2187,7 +2659,7 @@ class DesktopTest(unittest.TestCase):
         nav["checklist"].invoke()
         self.assertEqual(self.ui.empty_title.get(), "No checklists yet")
         Path(invalid).write_text("{")
-        self.ui.more_menu.buttons["Reload catalog"].invoke()
+        self.ui.more_menu.buttons["Reload"].invoke()
         self.assertEqual(nav["attention"].winfo_manager(), "grid")
         tree = self.ui.tree
         with patch("fetch_sources.read_page", return_value="1"):
@@ -2208,7 +2680,7 @@ class DesktopTest(unittest.TestCase):
         self.assertEqual(tree.set(invalid, "Status"), "Error")
         self.ui.nav_buttons["all"].invoke()
         self.root.update()
-        self.assertEqual(set(tree.get_children()), set(self.keys))
+        self.assertEqual(tree.get_children(), (valid,))
 
     def test_reset_search_reveals_counted_item_in_needs_attention(self):
         ui = self.ui
@@ -2242,7 +2714,7 @@ class DesktopTest(unittest.TestCase):
         (root / "pending.json").write_text(json.dumps({
             "version": "2", "release": "1" * 32, "sha256": {},
         }))
-        self.ui.more_menu.buttons["Reload catalog"].invoke()
+        self.ui.more_menu.buttons["Reload"].invoke()
         for view in ("updates", "attention"):
             self.ui.nav_buttons[view].invoke()
             self.root.update()
@@ -2429,7 +2901,7 @@ class DesktopTest(unittest.TestCase):
         self.root.update()
         editor = self.ui.editor
         self.assertEqual(editor.path, Path(self.keys[1]))
-        self.assertEqual(editor.tabs.tab(editor.tabs.select(), "text"), "Catalog")
+        self.assertEqual(editor.tabs.tab(editor.tabs.select(), "text"), "General")
 
     def test_get_all_without_a_prior_check_and_skip_current_downloads(self):
         self.ui.tree.selection_set(self.keys[1])
@@ -2574,6 +3046,8 @@ class DesktopTest(unittest.TestCase):
         path.write_text(json.dumps(data))
         self.ui.reload()
         self.assertEqual(self.ui.results[first].status, "Error")
+        self.ui.select_view("attention")
+        self.ui.tree.selection_set(first)
 
         editor = self.edit_selected()
         editor.fields["id"].set("Vendor.Alpha")
@@ -2594,7 +3068,7 @@ class DesktopTest(unittest.TestCase):
         with patch("fetch_sources.read_page", return_value="1"):
             self.click(self.ui.all_buttons["check"])
         editor = self.edit_selected()
-        catalog = next(tab for tab in editor.tabs.tabs() if editor.tabs.tab(tab, "text") == tr("Catalog"))
+        catalog = next(tab for tab in editor.tabs.tabs() if editor.tabs.tab(tab, "text") == tr("General"))
         catalog_widgets = list(descendants(editor.nametowidget(catalog)))
         labels = [w.cget("text") for w in catalog_widgets if isinstance(w, ttk.Label)]
         self.assertNotIn(tr("Description"), labels)
@@ -2665,6 +3139,7 @@ class DesktopTest(unittest.TestCase):
         path = Path(self.keys[0])
         path.write_text("{")
         self.ui.reload()
+        self.ui.select_view("attention")
         self.ui.edit_button.invoke()
         editor = self.ui.editor
         self.assertTrue(all(button.instate(["disabled"]) for button in editor.buttons.values()))

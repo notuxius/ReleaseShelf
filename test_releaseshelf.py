@@ -118,6 +118,31 @@ class ReleaseShelfTest(unittest.TestCase):
             result = Recipe.from_data(data).resolve()
         self.assertEqual(result.download, "https://publisher.example/1.27/setup-41.exe")
 
+    def test_publisher_confirmation_download(self):
+        from fetch_sources import Release, download_chunks
+        url = "https://publisher.ucoz.ru/tool.exe"
+        release = Release("1", url, "tool.exe", None)
+        recipe = Recipe.from_data(self.recipe)
+        form = Message()
+        form["Content-Type"] = "text/html"
+        responses = [addinfourl(io.BytesIO(b'<input type="hidden" name="ses" value="x+/=">'), form, url),
+                     addinfourl(io.BytesIO(b"archive"), Message(), url)]
+        with patch("fetch_sources.open_url", side_effect=responses) as request:
+            self.assertEqual(list(download_chunks(recipe, release)), [(None, False), b"archive"])
+        request.assert_called_with(url, data=b"ses=x%2B%2F%3D")
+
+    def test_versioned_member_tracks_new_filename(self):
+        self.recipe["extract"] = ["Tool {version}.exe"]
+        self.recipe_file.write_text(json.dumps(self.recipe))
+        for version in ("1.27", "1.28"):
+            self.page.write_text(f"SampleTool v{version}")
+            with zipfile.ZipFile(self.archive, "w") as package:
+                package.writestr(f"Tool {version}.exe", version.encode())
+            self.assertIn("Updated", self.cli("fetch"))
+            self.assertIn("Verified", self.cli("verify"))
+            self.assertEqual((self.job / "current" / f"Tool {version}.exe").read_text(), version)
+        self.assertFalse((self.job / "current" / "Tool 1.27.exe").exists())
+
     def cli(self, action, *, success=True, batch=None, expected_code=None):
         selection = ["--all", "--catalog", str(batch)] if batch else [str(self.recipe_file)]
         args = [str(PROJECT / "releaseshelf.py"), action, *selection, "--dest", str(self.dest)]
