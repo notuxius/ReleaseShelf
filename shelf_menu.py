@@ -5,7 +5,7 @@ from tkinter import ttk
 
 from shelf_icons import make_icon
 from shelf_i18n import tr
-from shelf_theme import work_area
+from shelf_theme import ARROW_DOWN, ARROW_UP, bind_button_badge, work_area
 
 
 class AppMenu(tk.Toplevel):
@@ -20,6 +20,7 @@ class AppMenu(tk.Toplevel):
         self.panel.pack(fill="both", expand=True)
         self.buttons = {}
         self.opening_pointer = None
+        self.previous_grab = None
         self.icon_names = {}
         self.images = {}
         self.bind("<ButtonPress>", self.outside_press)
@@ -115,6 +116,9 @@ class AppMenu(tk.Toplevel):
         self.deiconify()
         self.lift()
         self.update_idletasks()
+        previous = self.grab_current()
+        if previous is not self:
+            self.previous_grab = previous
         self.grab_set()
         self.focus_force()
         self.focus_on_open(keyboard)
@@ -142,7 +146,11 @@ class AppMenu(tk.Toplevel):
 
     def dismiss(self, event=None, *, restore_focus=True):
         if self.winfo_viewable():
-            self.grab_release()
+            if self.grab_current() is self:
+                self.grab_release()
+                if self.previous_grab is not None and self.previous_grab.winfo_exists():
+                    self.previous_grab.grab_set()
+            self.previous_grab = None
             self.withdraw()
             if restore_focus:
                 self.master.focus_set()
@@ -153,9 +161,17 @@ class DropdownMenu(AppMenu):
     def __init__(self, owner):
         super().__init__(owner)
         self.join = ttk.Frame(self, style="Surface.TFrame", height=1)
+        self.arrow = ttk.Label(owner, text=ARROW_DOWN, style="DropdownArrow.TLabel", takefocus=False)
+        self.arrow.place(relx=1, rely=0.5, x="-9p", anchor="e")
+        bind_button_badge(owner, self.arrow, self.sync_arrow)
         owner.configure(command=self.open_below)
         for key in ("<Down>", "<Return>", "<KP_Enter>", "<space>"):
             owner.bind(key, self.open_below)
+
+    def sync_arrow(self):
+        states = self.master.state()
+        self.arrow.state([s if s in states else f"!{s}" for s in ("disabled", "selected", "pressed", "active")])
+        self.arrow.configure(text=ARROW_UP if "selected" in states else ARROW_DOWN)
 
     def open_below(self, event=None):
         if self.winfo_viewable():
@@ -178,8 +194,10 @@ class DropdownMenu(AppMenu):
         # Keep the joining edge clear even when a menu is wider than its trigger.
         self.join.place(x=1, y=0 if below else height - 1, relwidth=1, width=-2, height=1)
         owner.state(["selected"])
+        self.sync_arrow()
         self.show_at(x, y, keyboard=keyboard)
 
     def dismiss(self, event=None, *, restore_focus=True):
         self.master.state(["!selected"])
+        self.sync_arrow()
         return super().dismiss(event, restore_focus=restore_focus)

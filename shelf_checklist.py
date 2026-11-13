@@ -7,7 +7,7 @@ import os
 from pathlib import Path
 import subprocess
 
-from fetch_sources import Recipe, companion_actions, filename
+from fetch_sources import CompanionActions, Recipe, companion_actions, filename
 from shelf_theme import write_preference
 
 
@@ -67,6 +67,7 @@ class LocalItem:
     name: str
     category: str
     path: Path
+    companions: CompanionActions = CompanionActions()
 
     def id_keys(self):
         return (self.id.casefold(),)
@@ -85,7 +86,7 @@ def catalog_item(data, *, path=None):
         location = Path(os.path.expandvars(location))
         if not location.is_absolute():
             location = ((path.parent if path else Path.cwd()) / location).resolve()
-        return LocalItem(item_id, name.strip(), category.strip(), location)
+        return LocalItem(item_id, name.strip(), category.strip(), location, companion_actions(data))
     if not isinstance(data, dict) or data.get("type") != "checklist":
         return Recipe.from_data(data, path=path)
     companion_actions(data)

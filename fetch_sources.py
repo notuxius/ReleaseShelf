@@ -17,11 +17,13 @@ from datetime import timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from time import monotonic
+from urllib.error import HTTPError
 from urllib.parse import quote, unquote, urlencode, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from shelf_cancel import check_canceled, file_sha256, publisher_items, read_chunks
 from shelf_message import message
+from shelf_pe_version import pe_file_version
 from shelf_version import __version__
 from shelf_windows_iso import open_windows_iso
 
@@ -40,6 +42,14 @@ def filename(value):
     return value
 
 
+@dataclass(frozen=True)
+class CompanionActions:
+    script: Path | None = None
+    admin: bool = False
+    manuals: tuple = ()
+    after_install: bool = True
+
+
 def companion_actions(data):
     def relative(value, extensions):
         if not isinstance(value, str):
@@ -56,7 +66,10 @@ def companion_actions(data):
         raise ValueError("restore_as_admin requires a restore script and a boolean value.")
     if not isinstance(manuals, list):
         raise ValueError("manual_files must be a list of relative instruction filenames.")
-    return script, admin, [relative(value, {".pdf", ".txt"}) for value in manuals]
+    after_install = data.get("restore_after_install", True)
+    if not isinstance(after_install, bool):
+        raise ValueError("restore_after_install must be true or false")
+    return CompanionActions(script, admin, tuple(relative(value, {".pdf", ".txt"}) for value in manuals), after_install)
 
 
 def source_url(url):
@@ -72,8 +85,9 @@ class CheckedRedirect(HTTPRedirectHandler):
         return super().redirect_request(req, fp, code, msg, headers, source_url(newurl))
 
 
-def open_url(url, *, method=None, data=None):
-    request = Request(source_url(url), headers={"User-Agent": f"ReleaseShelf/{__version__}"}, method=method, data=data)
+def open_url(url, *, method=None, data=None, headers=None):
+    request = Request(source_url(url), headers={"User-Agent": f"ReleaseShelf/{__version__}", **(headers or {})},
+                      method=method, data=data)
     return build_opener(CheckedRedirect()).open(request, timeout=30)
 
 
@@ -104,6 +118,65 @@ class Release:
     download: str
     archive: str
     checksum: str | None
+    asset: str = ""
+    modified: str = ""
+    source_folder: str = ""
+
+
+def github_snapshot_release(recipe):
+    """Prefer the tagged commit for a recipe that downloads a GitHub branch ZIP."""
+    url = urlsplit(recipe.download)
+    if url.netloc == "codeload.github.com":
+        separator = "/zip/"
+    elif url.netloc == "github.com":
+        separator = "/archive/"
+    else:
+        return None
+    repo, found, ref = url.path.lstrip("/").partition(separator)
+    if not found or not re.fullmatch(r"[\w.-]+/[\w.-]+", repo, re.ASCII):
+        return None
+    api = f"https://api.github.com/repos/{repo}"
+    ref = unquote(ref)
+    if url.netloc == "github.com":
+        if not ref.endswith(".zip"):
+            return None
+        ref = ref[:-4]
+    branch = ref.removeprefix("refs/heads/")
+    if ref in ("{asset}", "{version}"):
+        # Commit API recipes pin each download to the SHA returned for a branch.
+        if not recipe.page.startswith(api + "/commits/"):
+            return None
+        branch = unquote(recipe.page[len(api + "/commits/"):]).removeprefix("refs/heads/")
+    elif not ref.startswith("refs/heads/") and ref not in ("main", "master", "HEAD"):
+        return None
+    if (not branch or "?" in branch or "#" in branch or branch.startswith(("refs/tags/", "tags/"))
+            or re.fullmatch(r"[0-9a-fA-F]{7,40}", branch)
+            or (recipe.page and not recipe.page.startswith(api + "/commits/"))
+            or recipe.sha256_pattern or recipe.direct_version):
+        return None
+    try:
+        latest = read_page(api + "/releases/latest")
+    except HTTPError as exc:
+        if exc.code != 404:
+            raise
+        exc.close()
+        return None
+    tag = json.loads(latest)["tag_name"].strip()
+    if not tag:
+        raise ValueError("Empty GitHub release tag")
+    tagged_ref = quote("refs/tags/" + tag, safe="")
+    sha = json.loads(read_page(f"{api}/commits/{tagged_ref}"))["sha"]
+    if not re.fullmatch(r"[0-9a-f]{40}", sha):
+        raise ValueError("Invalid GitHub release commit")
+    archive = filename(recipe.archive.replace("{version}", tag).replace("{asset}", sha))
+    if recipe.extract and archive.casefold() == "files":
+        raise ValueError("The archive filename conflicts with the extraction folder")
+    name = repo.split("/")[1]
+    folder = ""
+    if recipe.extract_folder in (f"{name}-{branch}", f"{name}-{ref}"):
+        folder = f"{name}-{sha}"
+    return Release(tag, f"https://codeload.github.com/{repo}/zip/{sha}", archive, recipe.checksum,
+                   asset=sha, source_folder=folder)
 
 
 @dataclass(frozen=True)
@@ -131,6 +204,8 @@ class Recipe:
     apply_custom_settings: bool = False
     settings_files: tuple | None = None
     updates_disabled: bool = False
+    companions: CompanionActions = CompanionActions()
+    direct_version: str = ""
 
     @classmethod
     def read(cls, path):
@@ -140,7 +215,7 @@ class Recipe:
     def from_data(cls, data, *, path=None):
         if not isinstance(data, dict):
             raise ValueError("A recipe must be a JSON object")
-        companion_actions(data)
+        companions = companion_actions(data)
         updates_disabled = data.get("updates_disabled", False)
         if not isinstance(updates_disabled, bool):
             raise ValueError("updates_disabled must be true or false")
@@ -179,6 +254,16 @@ class Recipe:
         checksum = sha256(data["sha256"]) if "sha256" in data else None
         github = data.get("github", "")
         page = pattern = download = asset = archive = checksum_pattern = resolver = ""
+        direct_version = data.get("direct_version", "")
+        if "direct_version" in data:
+            if "direct_download" not in data or not isinstance(direct_version, str):
+                raise ValueError("direct_version requires a direct download")
+            if direct_version.startswith("url:"):
+                if re.compile(direct_version[4:]).groups != 1:
+                    raise ValueError("The download URL pattern needs one version capture group")
+            elif direct_version not in ("file_version", "qt_installer") and not (
+                    checksum and re.fullmatch(r"[0-9][a-zA-Z0-9. -]{0,63}", direct_version)):
+                raise ValueError("Use an installer version source or pin a named release by SHA-256")
         if "direct_download" in data:
             if any(key in data for key in ("github", "page", "version_pattern", "download", "download_resolver", "sha256_pattern")):
                 raise ValueError("Use one source per recipe")
@@ -241,7 +326,7 @@ class Recipe:
                    checksum, publish_exe, previous_ids=previous_ids, sha256_pattern=checksum_pattern,
                    download_resolver=resolver, extract_folder=extract_folder, shortcut=shortcut,
                    apply_custom_settings=apply_settings, settings_files=settings, updates_disabled=updates_disabled,
-                   companion_dir=path.parent / "companions" / path.stem if path is not None else None, **metadata)
+                   direct_version=direct_version, companions=companions, companion_dir=path.parent / "companions" / path.stem if path is not None else None, **metadata)
 
     def id_keys(self):
         return tuple(dict.fromkeys(value.casefold() for value in (self.id, *self.previous_ids)))
@@ -277,7 +362,7 @@ class Recipe:
                   ("page", "version_pattern", "download", "archive", "extract")}
         fields["id"] = self.id if recipe_id is None else recipe_id
         fields.update({key: getattr(self, key) for key in
-                       ("github", "asset_pattern", "checksum", "sha256_pattern", "download_resolver", "extract_folder")
+                       ("github", "asset_pattern", "checksum", "sha256_pattern", "download_resolver", "extract_folder", "direct_version")
                        if getattr(self, key)})
         if self.publish_exe:
             fields["publish_exe"] = self.publish_exe
@@ -289,13 +374,47 @@ class Recipe:
         return any(saved == self.fingerprint(value) for value in (self.id, *self.previous_ids))
 
     def resolve(self):
+        snapshot = github_snapshot_release(self)
+        if snapshot is not None:
+            return snapshot
         if self.download and not self.page:
             with open_url(self.download, method="HEAD") as response:
                 modified = response.headers.get("Last-Modified")
                 if not modified:
                     raise ValueError("The download has no Last-Modified header.")
-                version = parsedate_to_datetime(modified).astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-            return Release(version, self.download, self.archive, self.checksum)
+                if not self.direct_version:
+                    version = parsedate_to_datetime(modified).astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+                    return Release(version, self.download, self.archive, self.checksum)
+                url = source_url(response.url)
+                length = response.headers.get("Content-Length")
+            if self.direct_version.startswith("url:"):
+                match = re.search(self.direct_version[4:], unquote(urlsplit(url).path))
+                if not match or not match[1]:
+                    raise ValueError("No version in the resolved installer URL")
+                version = match[1]
+            elif self.direct_version in ("file_version", "qt_installer"):
+                if not length:
+                    raise ValueError("Missing installer size for version lookup")
+                size = int(length)
+
+                def read(offset, count):
+                    if count <= 0 or offset < 0 or offset + count > size:
+                        raise ValueError("Invalid installer metadata range")
+                    end = offset + count - 1
+                    headers = {"Range": f"bytes={offset}-{end}", "If-Unmodified-Since": modified}
+                    with open_url(url, headers=headers) as part:
+                        if (part.status != 206 or part.headers.get("Content-Range") != f"bytes {offset}-{end}/{size}"
+                                or part.headers.get("Last-Modified") != modified):
+                            raise ValueError("The server did not return the requested installer metadata")
+                        block = part.read(count + 1)
+                    if len(block) != count:
+                        raise ValueError("Incomplete installer metadata")
+                    return block
+
+                version = installer_version(self.direct_version, size, read)
+            else:
+                version = self.direct_version
+            return Release(version, url, self.archive, self.checksum, modified=modified)
         if not self.github:
             page = read_page(self.page)
             match = re.search(self.version_pattern, page)
@@ -303,6 +422,7 @@ class Recipe:
             if not version:
                 raise ValueError("Available version unknown: version_pattern did not match the page")
             download = self.download.replace("{version}", quote(version, safe=""))
+            asset = ""
             if "{asset}" in self.download:
                 asset = match.group("asset")
                 if not asset:
@@ -317,10 +437,10 @@ class Recipe:
                 if checksum and checksum != published:
                     raise ValueError("Publisher and recipe checksums disagree")
                 checksum = published
-            archive = filename(self.archive.replace("{version}", version))
+            archive = filename(self.archive.replace("{version}", version).replace("{asset}", asset))
             if self.extract and archive.casefold() == "files":
                 raise ValueError("The archive filename conflicts with the extraction folder")
-            return Release(version, download, archive, checksum)
+            return Release(version, download, archive, checksum, asset)
 
         release = json.loads(read_page(f"https://api.github.com/repos/{self.github}/releases/latest"))
         version = release["tag_name"].strip()
@@ -394,6 +514,18 @@ def windows_product_version(path):
     raise ValueError(message("No ProductVersion string in {file}", file=path.name))
 
 
+def installer_version(source, size, read):
+    if source == "file_version":
+        return pe_file_version(read)
+    tail_size = min(size, 65536)
+    tail = read(size - tail_size, tail_size)
+    versions = re.findall(rb"<Installer>\s*<Name>[^<]+</Name>(?:(?!</Installer>).){0,4096}?"
+                          rb"<Version>([0-9]+(?:\.[0-9]+)+)</Version>", tail, re.DOTALL)
+    if len(versions) != 1:
+        raise ValueError("No unique Qt installer package version")
+    return versions[0].decode("ascii")
+
+
 def copy_with_progress(response, target, total, on_progress):
     """Report transferred bytes, then (None, None) when the transfer ends."""
     write_chunks(read_chunks(response), target, total, on_progress)
@@ -424,9 +556,19 @@ def write_chunks(chunks, target, total, on_progress):
 
 
 def download_chunks(recipe, release):
+    download = release.download
+    if re.fullmatch(r"https://www\.majorgeeks\.com/mg/getmirror/[a-zA-Z0-9_-]+,\d+\.html", download):
+        # MajorGeeks rotates the file server and token on its mirror landing page.
+        page = read_page(download)
+        mirror = re.search(r'<!--\s*Debug:\s*(https://files\d+\.majorgeeks\.com/[\w./%+-]+)\s*-->', page)
+        if not mirror:
+            raise ValueError("MajorGeeks did not provide a download link")
+        download = mirror[1]
     stream = (open_windows_iso(release.version, release.checksum) if recipe.download_resolver
-              else open_url(release.download))
+              else open_url(download))
     with stream as response:
+        if release.modified and response.headers.get("Last-Modified") != release.modified:
+            raise ValueError("Installer changed during the download. Check for updates again.")
         if ((urlsplit(release.download).hostname or "").endswith(".ucoz.ru")
                 and response.headers.get_content_type() == "text/html"):
             # uCoz serves a same-URL confirmation form before executable downloads.
@@ -454,7 +596,8 @@ def response_chunks(response):
 def extract_windows_archive(recipe, release, archive, destination):
     """Read the Windows tar stream and create only validated directories and regular files."""
     tar = Path(os.environ["SystemRoot"]) / "System32" / "tar.exe"
-    prefix = recipe.extract_folder.replace("{version}", release.version)
+    prefix = release.source_folder or (recipe.extract_folder.replace("{version}", release.version)
+                                      .replace("{asset}", release.asset))
     if prefix and recipe.extract_folder != ".":
         filename(prefix)
     destination.mkdir()

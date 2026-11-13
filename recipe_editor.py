@@ -30,14 +30,14 @@ OPTIONAL_FIELDS = ("filename", "sha256", "product_version", "publish_exe", "extr
 FIELD_LABELS = {
     "id": "Item ID", "name": "Name", "category": "Category",
     "page": "Publisher page URL", "version_pattern": "Version pattern", "download": "Download URL",
-    "direct_download": "Download URL", "local_path": "Local path",
+    "direct_version": "Version source (optional)", "direct_download": "Download URL", "local_path": "Local path",
     "github": "Repository", "asset_pattern": "Asset pattern", "filename": "Archive filename",
     "sha256": "Archive SHA-256", "sha256_pattern": "SHA-256 pattern (optional)",
     "product_version": "Check EXE version", "publish_exe": "Publish EXE",
     "extract_folder": "Publish archive folder", "shortcut": "Start menu shortcut name",
 }
-ACTIONS = {"check": "Check for updates", "fetch": "Get updates", "verify": "Verify files"}
-ACTION_ICONS = {"check": "check", "fetch": "download", "verify": "verify"}
+ACTIONS = {"fetch": "Get updates", "verify": "Verify files"}
+ACTION_ICONS = {"fetch": "download", "verify": "verify"}
 # The clam notebook contributes two pixels at each edge, one more than the catalog card.
 TAB_PADDING = (WINDOW_SIDE_PADDING // 2 - 1, 16)
 
@@ -112,7 +112,8 @@ def save_recipe(catalog, data, path, original):
 
 
 class RecipeEditor(tk.Toplevel):
-    def __init__(self, parent, catalog, path, palette, on_saved, *, on_action=None, categories=(), example=None):
+    def __init__(self, parent, catalog, path, palette, on_saved, *, on_action=None, categories=(), example=None,
+                 get_app_folder=None):
         self.original = path.read_bytes() if path is not None else None
         self.data = dict(example or {})
         raw = None
@@ -165,16 +166,22 @@ class RecipeEditor(tk.Toplevel):
                       style="Muted.TLabel").grid(row=3, column=1, sticky="w", pady=(0, 10))
             self.field(catalog_tab, 4, "category", choices=categories)
             self.apply_settings = tk.BooleanVar(self, self.data.get("apply_custom_settings", False))
-            if path is not None and "local_path" not in self.data:
-                item = Recipe.from_data(self.data, path=path)
-                if item.apply_custom_settings or item.has_portable_settings():
+            self.restore_after_install = tk.BooleanVar(self, self.data.get("restore_after_install", True))
+            if path is not None:
+                item = catalog_item(self.data, path=path)
+                portable_settings = isinstance(item, Recipe) and item.has_portable_settings()
+                if isinstance(item, Recipe) and (item.apply_custom_settings or portable_settings):
                     self.settings_button = ttk.Checkbutton(catalog_tab, text=tr("Apply custom settings"),
                                                            variable=self.apply_settings)
                     self.settings_button.grid(row=5, column=1, sticky="w", pady=(8, 0))
                     ttk.Label(catalog_tab, text=tr("Use the saved config on Save and Get updates."),
                               style="Muted.TLabel").grid(row=6, column=1, sticky="w")
-                add_companion_buttons(catalog_tab, self.data, lambda: item.companion_dir,
-                                      lambda error: self.error.set(error), 7, open_instructions=False)
+                if item.companions.script or portable_settings:
+                    ttk.Checkbutton(catalog_tab, text=tr("Run restore script after installation"),
+                                    variable=self.restore_after_install).grid(row=7, column=1, sticky="w", pady=(6, 0))
+                add_companion_buttons(catalog_tab, self.data, lambda: path.parent / "companions" / path.stem,
+                                      lambda error: self.error.set(error), 8, open_instructions=False,
+                                      get_app_folder=get_app_folder)
             source = ttk.Frame(tabs, padding=TAB_PADDING)
             source.columnconfigure(1, weight=1)
             self.add_tab(source, "Source", "language")
@@ -213,8 +220,9 @@ class RecipeEditor(tk.Toplevel):
             self.field(github, 1, "asset_pattern")
             direct = self.source_frames["Direct download"]
             self.field(direct, 0, "direct_download")
-            ttk.Label(direct, text=tr("Track the publisher's download modification time."),
-                      style="Muted.TLabel").grid(row=1, column=1, sticky="w")
+            self.field(direct, 1, "direct_version")
+            ttk.Label(direct, text=tr("Leave blank to track the download modification time."),
+                      style="Muted.TLabel").grid(row=2, column=1, sticky="w")
             self.field(self.source_frames["Local file or folder"], 0, "local_path")
             ttk.Label(github, text=tr("Example: owner/repository and *-windows-x64.zip"), style="Muted.TLabel"
                       ).grid(row=2, column=1, sticky="w")
@@ -391,6 +399,8 @@ class RecipeEditor(tk.Toplevel):
         if self.raw_editor:
             return json.loads(self.text_area.get("1.0", "end-1c"))
         data = self.data.copy()
+        if not self.restore_after_install.get() or "restore_after_install" in data:
+            data["restore_after_install"] = self.restore_after_install.get()
         if self.apply_settings.get() or "apply_custom_settings" in data:
             data["apply_custom_settings"] = self.apply_settings.get()
         for key in ("name", "category"):
@@ -400,6 +410,10 @@ class RecipeEditor(tk.Toplevel):
             else:
                 data.pop(key, None)
         source = self.source.get()
+        if source == "Direct download" and (value := self.fields["direct_version"].get().strip()):
+            data["direct_version"] = value
+        else:
+            data.pop("direct_version", None)
         if source == "Local file or folder":
             data.pop("updates_disabled", None)
         for other, fields in SOURCE_FIELDS.items():
@@ -426,7 +440,9 @@ class RecipeEditor(tk.Toplevel):
                 raise ValueError(message("Enter a value for {key}.", key=message(FIELD_LABELS[key])))
             data[key] = value
         if source == "Local file or folder":
-            return {key: data[key] for key in ("id", "name", "category", "local_path") if key in data}
+            local_fields = ("id", "name", "category", "local_path", "restore_script", "restore_after_install",
+                            "restore_as_admin", "manual_files")
+            return {key: data[key] for key in local_fields if key in data}
         for key in OPTIONAL_FIELDS:
             value = self.fields[key].get()
             if value:

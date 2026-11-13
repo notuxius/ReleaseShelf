@@ -16,6 +16,7 @@ import tempfile
 from threading import Event, Thread
 import unittest
 from unittest.mock import patch
+from urllib.error import HTTPError
 from urllib.parse import urlsplit
 from urllib.response import addinfourl
 import zipfile
@@ -111,12 +112,137 @@ class ReleaseShelfTest(unittest.TestCase):
         self.assertEqual(request.call_args.args[0].get_method(), "HEAD")
         self.assertEqual((release.version, release.download), ("2026-11-10 16:20:57 UTC", url))
 
+    def test_direct_url_version_detects_repack_and_rejects_changed_transfer(self):
+        url = "https://publisher.example/installer-1.2.exe"
+        job = Recipe.from_data({"id": "setup", "direct_download": url,
+                                "direct_version": r"url:/installer-([0-9.]+)\.exe$"})
+        stamp = "Tue, 10 Nov 2026 16:20:57 GMT"
+        transfer_stamp = stamp
+
+        def reply(_url, *, method=None):
+            headers = Message()
+            headers["Last-Modified"] = stamp if method == "HEAD" else transfer_stamp
+            return addinfourl(io.BytesIO(b"setup"), headers, url, 200)
+
+        with patch("fetch_sources.open_url", side_effect=reply):
+            self.assertEqual(execute("fetch", job, self.dest, {}).local, "1.2")
+            self.assertEqual(execute("check", job, self.dest, {}).status, "Latest")
+            stamp = "Wed, 11 Nov 2026 16:20:57 GMT"
+            self.assertEqual(execute("check", job, self.dest, {}).status, "Update available")
+            self.assertEqual(execute("fetch", job, self.dest, {}).status, "Error")
+            transfer_stamp = stamp
+            self.assertEqual(execute("fetch", job, self.dest, {}).status, "Updated")
+
+    @unittest.skipUnless(os.name == "nt", "Uses a real Windows executable")
+    def test_direct_version_uses_bounded_installer_metadata_reads(self):
+        exe = Path(sys.executable)
+        url = "https://publisher.example/setup.exe"
+        template = {"id": "setup", "direct_download": url}
+        for source, payload, expected in (
+                ("file_version", exe.read_bytes(), windows_product_version(exe)),
+                ("qt_installer", bytes(80000) + b"<Installer><Name>Pro</Name><Version>4.7</Version></Installer>", "4.7")):
+            job = Recipe.from_data({**template, "direct_version": source})
+            counts = []
+
+            def reply(_url, *, method=None, headers=None):
+                meta = Message()
+                meta["Last-Modified"] = "Tue, 10 Nov 2026 16:20:57 GMT"
+                if method == "HEAD":
+                    meta["Content-Length"] = str(len(payload))
+                    return addinfourl(io.BytesIO(), meta, url, 200)
+                start, end = map(int, headers["Range"].removeprefix("bytes=").split("-"))
+                counts.append(end - start + 1)
+                meta["Content-Range"] = f"bytes {start}-{end}/{len(payload)}"
+                return addinfourl(io.BytesIO(payload[start:end + 1]), meta, url, 206)
+
+            with self.subTest(source=source), patch("fetch_sources.open_url", side_effect=reply):
+                self.assertEqual(job.resolve().version, expected)
+                self.assertLess(sum(counts), len(payload))
+
     def test_version_and_build_tokens_come_from_same_page_match(self):
         data = {**self.recipe, "version_pattern": r"v([0-9.]+) build (?P<asset>\d+)",
                 "download": "https://publisher.example/{version}/setup-{asset}.exe"}
         with patch("fetch_sources.read_page", return_value="v1.27 build 41"):
             result = Recipe.from_data(data).resolve()
         self.assertEqual(result.download, "https://publisher.example/1.27/setup-41.exe")
+
+    @unittest.skipUnless(os.name == "nt", "Uses Windows tar for source ZIPs")
+    def test_github_commit_snapshot_switches_to_release_and_follows_tags(self):
+        api = "https://api.github.com/repos/owner/tool"
+        source = "https://codeload.github.com/owner/tool/zip/"
+        commits = ["a" * 40, "b" * 40, "c" * 40]
+        recipe = Recipe.from_data({
+            "id": "sample-tool", "page": api + "/commits/main",
+            "version_pattern": r"date=(\S+) sha=(?P<asset>[a-f0-9]{40})",
+            "download": source + "{asset}", "filename": "tool-{asset}.zip",
+            "extract_folder": "tool-{asset}", "extract": ["Install.cmd"],
+        })
+        live = self.job / "current" / "Install.cmd"
+        tag = None
+
+        def lookup(url):
+            if url == api + "/releases/latest":
+                if tag is None:
+                    raise HTTPError(url, 404, "Not Found", {}, None)
+                return json.dumps({"tag_name": tag, "assets": []})
+            if tag is None:
+                self.assertEqual(url, recipe.page)
+                return "date=2026-11-13 sha=" + commits[0]
+            self.assertEqual(url, api + "/commits/refs%2Ftags%2F" + tag)
+            return json.dumps({"sha": commit})
+
+        def archive(url):
+            self.assertEqual(url, source + commit)
+            data = io.BytesIO()
+            with zipfile.ZipFile(data, "w") as package:
+                package.writestr("tool-" + commit + "/Install.cmd", commit)
+            data.seek(0)
+            return addinfourl(data, Message(), url)
+
+        with (patch("fetch_sources.read_page", side_effect=lookup),
+              patch("fetch_sources.open_url", side_effect=archive) as downloads):
+            for tag, commit in zip((None, "v1.0", "v1.1"), commits):
+                version = tag or "2026-11-13"
+                checked = execute("check", recipe, self.dest, {})
+                self.assertEqual((checked.status, checked.available), ("Update available", version))
+                updated = execute("fetch", recipe, self.dest, {})
+                self.assertEqual((updated.status, updated.local), ("Updated", version), updated.detail)
+                self.assertEqual(live.read_text(), commit)
+                self.assertEqual(execute("check", recipe, self.dest, {}).status, "Latest")
+                self.assertEqual(execute("verify", recipe, self.dest, {}).local, version)
+            self.assertEqual(downloads.call_count, 3)
+
+    def test_direct_github_branch_zip_checks_releases_and_preserves_lookup_errors(self):
+        url = "https://github.com/owner/tool/archive/refs/heads/main.zip"
+        recipe = Recipe.from_data({"id": "tool", "direct_download": url, "extract_folder": "tool-main",
+                                   "extract": ["Install.cmd"]})
+        sha = "1" * 40
+        with patch("fetch_sources.read_page", side_effect=[json.dumps({"tag_name": "v2"}), json.dumps({"sha": sha})]):
+            release = recipe.resolve()
+        self.assertEqual((release.version, release.source_folder), ("v2", "tool-" + sha))
+        with (patch("fetch_sources.read_page", side_effect=HTTPError(url, 403, "Forbidden", {}, None)),
+              patch("fetch_sources.open_url") as download):
+            with self.assertRaises(HTTPError):
+                recipe.resolve()
+            download.assert_not_called()
+
+    @unittest.skipUnless(os.name == "nt", "Uses Windows tar")
+    def test_distinct_builds_with_same_version_publish_the_correct_folder(self):
+        self.recipe_file.write_text(json.dumps({
+            **self.recipe, "version_pattern": r"v([0-9.]+) build (?P<asset>\d+)",
+            "download": self.recipe["download"].replace("sample-tool", "build-{asset}"),
+            "filename": "build-{asset}.zip", "extract_folder": "build-{asset}",
+            "extract": ["tool.exe"],
+        }))
+        for build in ("41", "42"):
+            self.page.write_text(f"v1.27 build {build}")
+            with zipfile.ZipFile(self.publisher / f"build-{build}.zip", "w") as package:
+                package.writestr(f"build-{build}/tool.exe", build)
+            self.assertIn("Update available: 1.27", self.cli("check"))
+            self.assertIn("Updated: 1.27", self.cli("fetch"))
+            self.assertEqual((self.job / "current/tool.exe").read_text(), build)
+            self.assertIn("Latest: 1.27", self.cli("check"))
+            self.assertIn("Verified: 1.27", self.cli("verify"))
 
     def test_publisher_confirmation_download(self):
         from fetch_sources import Release, download_chunks
@@ -130,6 +256,21 @@ class ReleaseShelfTest(unittest.TestCase):
         with patch("fetch_sources.open_url", side_effect=responses) as request:
             self.assertEqual(list(download_chunks(recipe, release)), [(None, False), b"archive"])
         request.assert_called_with(url, data=b"ses=x%2B%2F%3D")
+
+    def test_majorgeeks_download_follows_current_mirror_link(self):
+        from fetch_sources import Release, download_chunks
+        page = "https://www.majorgeeks.com/mg/getmirror/tool,1.html"
+        url = "https://files3.majorgeeks.com/token/downloads/tool.zip"
+        release = Release("1", page, "tool.zip", None)
+        recipe = Recipe.from_data(self.recipe)
+        with patch("fetch_sources.read_page", return_value=f"<!-- Debug: {url} -->") as landing, \
+             patch("fetch_sources.open_url", return_value=addinfourl(io.BytesIO(b"zip"), Message(), url)) as request:
+            self.assertEqual(list(download_chunks(recipe, release)), [(None, False), b"zip"])
+            landing.assert_called_once_with(page)
+            request.assert_called_once_with(url)
+        with patch("fetch_sources.read_page", return_value="<!-- Debug: https://unrelated.example/tool.zip -->"):
+            with self.assertRaisesRegex(ValueError, "download link"):
+                list(download_chunks(recipe, release))
 
     def test_versioned_member_tracks_new_filename(self):
         self.recipe["extract"] = ["Tool {version}.exe"]

@@ -2,17 +2,67 @@
 
 from contextlib import ExitStack
 import ctypes
+from http.client import HTTPException
+import json
+import lzma
 from pathlib import Path
+import re
+import shutil
 import struct
 import sys
+import tempfile
 import tkinter as tk
+from urllib.parse import urlsplit
+import zipfile
 import zlib
 
-from fetch_sources import Recipe, filename
+from fetch_sources import Recipe, filename, open_url, read_page
 from fetch_store import read_state, stamp
+from shelf_checklist import LocalItem
 
 
 ICON_SIZE = 16
+
+
+def store_product_id(job):
+    if isinstance(job, Recipe):
+        match = re.fullmatch(r"https://get\.microsoft\.com/installer/download/([a-z0-9]{12})/?(?:\?[^#]*)?",
+                             job.download, re.IGNORECASE | re.ASCII)
+        if match:
+            return match[1].upper()
+
+
+def fetch_store_logo(product, results):
+    """Fetch only the catalog product's logo. Tk images are created by the UI thread."""
+    data = None
+    try:
+        catalog = read_page(f"https://displaycatalog.mp.microsoft.com/v7.0/products/{product}?market=US&languages=en-US")
+        for localized in json.loads(catalog)["Product"]["LocalizedProperties"]:
+            for image in localized.get("Images", []):
+                if image.get("ImagePurpose") != "Logo":
+                    continue
+                uri = urlsplit(image.get("Uri", ""))
+                if uri.hostname != "store-images.s-microsoft.com" or not uri.path.startswith("/image/"):
+                    continue
+                url = f"https://store-images.s-microsoft.com{uri.path}?w={ICON_SIZE}&h={ICON_SIZE}&format=png"
+                with open_url(url) as response:
+                    raw = response.read(65537)
+                if (len(raw) <= 65536 and raw.startswith(b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR")
+                        and raw[16:24] == struct.pack(">II", ICON_SIZE, ICON_SIZE)):
+                    data = raw
+                    return
+    except (OSError, HTTPException, ValueError, KeyError, TypeError, AttributeError):
+        pass
+    finally:
+        results.put(data)
+
+
+def cache_store_logo(path, data):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=path.parent) as staging:
+        image = Path(staging) / "logo.png"
+        image.write_bytes(data)
+        image.replace(path)
 
 
 class _Handle(ctypes.c_void_p):
@@ -85,10 +135,65 @@ def _disc_icon(master):
     return tk.PhotoImage(master=master, file=Path(__file__).parent / "assets" / "disc.png")
 
 
-def load_app_icon(master, job, dest):
-    if not isinstance(job, Recipe):
-        return None
+def _msi_icon(master, path):
+    # Open the installer database read-only and use the icon registered for Programs and Features.
+    msi = ctypes.windll.msi
+    db, view, record = (ctypes.c_uint() for _ in range(3))
+    query = ("SELECT Icon.Data FROM Icon, Property WHERE Property.Property = 'ARPPRODUCTICON' "
+             "AND Icon.Name = Property.Value")
+    with ExitStack() as cleanup:
+        if msi.MsiOpenDatabaseW(str(path), None, ctypes.byref(db)):
+            return None
+        cleanup.callback(msi.MsiCloseHandle, db)
+        if msi.MsiDatabaseOpenViewW(db, query, ctypes.byref(view)):
+            return None
+        cleanup.callback(msi.MsiCloseHandle, view)
+        if msi.MsiViewExecute(view, 0) or msi.MsiViewFetch(view, ctypes.byref(record)):
+            return None
+        cleanup.callback(msi.MsiCloseHandle, record)
+        size = ctypes.c_uint(msi.MsiRecordDataSize(record, 1))
+        if not 0 < size.value <= 16 * 1024 * 1024:
+            return None
+        raw = ctypes.create_string_buffer(size.value)
+        if msi.MsiRecordReadStream(record, 1, raw, ctypes.byref(size)):
+            return None
+        folder = cleanup.enter_context(tempfile.TemporaryDirectory())
+        icon_path = Path(folder) / ("product.exe" if raw[:2] == b"MZ" else "product.ico")
+        icon_path.write_bytes(raw[:size.value])
+        return _executable_icon(master, icon_path)
+
+
+def _zip_icon(master, path):
     try:
+        with zipfile.ZipFile(path) as package:
+            members = [info for info in package.infolist() if info.filename.lower().endswith((".exe", ".ico"))]
+            # Prefer the main EXE, then other EXEs, then packaged icon files.
+            members.sort(key=lambda info: (info.filename.lower().endswith(".ico"), len(Path(info.filename).parts)))
+            if not members:
+                return None
+            with tempfile.TemporaryDirectory() as folder:
+                for info in members:
+                    candidate = Path(folder) / ("candidate" + Path(info.filename).suffix.lower())
+                    try:
+                        with package.open(info) as src, candidate.open("wb") as dst:
+                            shutil.copyfileobj(src, dst)
+                    except (zipfile.BadZipFile, EOFError, RuntimeError, OSError, zlib.error, lzma.LZMAError):
+                        continue
+                    icon = _executable_icon(master, candidate)
+                    if icon is not None:
+                        return icon
+    except (OSError, ValueError, zipfile.BadZipFile):
+        pass
+    return None
+
+
+def load_app_icon(master, job, dest):
+    try:
+        if isinstance(job, LocalItem) and sys.platform == "win32" and not job.path.drive.startswith("\\\\"):
+            loader = {".zip": _zip_icon, ".msi": _msi_icon, ".exe": _executable_icon}.get(job.path.suffix.lower())
+            return loader(master, job.path) if loader else None
+        if not isinstance(job, Recipe):
+            return None
         if job.primary(job.archive or job.asset_pattern).lower().endswith(".iso"):
             return _disc_icon(master)
         if sys.platform != "win32" or dest.drive.startswith("\\\\"):
@@ -98,25 +203,34 @@ def load_app_icon(master, job, dest):
         if not state:
             return None
         job = job.versioned_members(state["version"])
-        primary = job.primary(filename(state.get("archive", job.archive)))
+        archive = filename(state.get("archive", job.archive))
+        primary = job.primary(archive)
         if primary.lower().endswith(".iso"):
             return _disc_icon(master)
         candidates = []
-        if primary.lower().endswith(".exe"):
-            published = state.get("published", {})
-            path = Path(published.get("path", ""))
-            if path.is_absolute() and not path.drive.startswith("\\\\"):
-                candidates.append((path, primary, published.get("stat")))
+        published = state.get("published", {})
+        published_path = Path(published.get("path", ""))
+        local_published = published_path.is_absolute() and not published_path.drive.startswith("\\\\")
+        if primary.lower().endswith((".exe", ".msi")) and local_published:
+            candidates.append((published_path, primary, published.get("stat")))
         members = dict.fromkeys([primary, *("files/" + name for name in job.extract)])
         for member in members:
-            if member.lower().endswith(".exe"):
+            if member.lower().endswith((".exe", ".msi")):
                 path = root / "releases" / state["release"] / member
                 candidates.append((path, member, state.get("stats", {}).get(member)))
+        if archive.lower().endswith(".zip"):
+            path = root / "releases" / state["release"] / archive
+            candidates.append((path, archive, state.get("stats", {}).get(archive)))
+            if primary == archive and local_published:
+                candidates.append((published_path, archive, published.get("stat")))
         for path, member, recorded in candidates:
             # Use recorded file metadata here. Hashing changed executables on the
             # UI thread would make opening a large catalog unnecessarily slow.
             if state["sha256"].get(member) and path.is_file() and (not recorded or recorded == stamp(path)):
-                icon = _executable_icon(master, path)
+                if member.lower().endswith(".zip"):
+                    return _zip_icon(master, path)
+                loader = _msi_icon if member.lower().endswith(".msi") else _executable_icon
+                icon = loader(master, path)
                 if icon is not None:
                     return icon
     except (OSError, ValueError, TypeError, AttributeError, tk.TclError):

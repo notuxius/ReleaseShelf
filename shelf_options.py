@@ -79,6 +79,7 @@ class OptionsWindow(tk.Toplevel):
         self.apply_language(language)
         self.apply_theme(palette)
         initial_geometry(self, 460, self.winfo_reqheight(), parent=parent)
+        self.grab_set()
         self.mode_buttons[mode.get()].focus_set()
 
     def apply_language(self, code):
@@ -102,7 +103,7 @@ class OptionsWindow(tk.Toplevel):
         self.configure(background=palette.canvas)
         self.close_icon = make_icon(self, "cancel", palette.text)
         self.close_button.configure(image=self.close_icon)
-        self.language_icon = make_icon(self, "language", palette.accent, 20)
+        self.language_icon = make_icon(self, "language", palette.accent)
         self.language_button.configure(image=self.language_icon)
         self.language_menu.apply_theme(palette)
         mode = "Dark" if palette.is_dark else "Light"

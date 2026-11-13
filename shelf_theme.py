@@ -13,6 +13,9 @@ from shelf_text import TREE_TEXT_PAD
 
 THEME_MODES = ("System", "Light", "Dark")
 WINDOW_SIDE_PADDING = 22
+ARROW_UP = "▲"
+ARROW_DOWN = "▼"
+HEADING_FONT = ("Segoe UI Semibold", 9)
 
 
 @dataclass(frozen=True)
@@ -218,16 +221,22 @@ def style_heading_dividers(style, color):
     style.tk.call(bottom_line, "put", color, "-to", 0, 0, 256, 1)
 
 
+def bind_button_badge(button, badge, sync):
+    for event in ("<Enter>", "<Leave>", "<ButtonPress-1>", "<ButtonRelease-1>"):
+        badge.bind(event, lambda e, seq=event: button.event_generate(
+            seq, x=e.x_root - button.winfo_rootx(), y=e.y_root - button.winfo_rooty(), state=e.state))
+    # ttk's class bindings set the button state after widget bindings run.
+    for event in ("<Enter>", "<Leave>", "<ButtonPress-1>", "<ButtonRelease-1>", "<space>", "<<Invoke>>"):
+        button.bind(event, lambda _: button.after_idle(sync), add="+")
+
 def style_dropdowns(style, palette):
-    indicator = "ReleaseShelf.dropdownIndicator"
+    combo_arrow = "ReleaseShelf.comboArrow"
     down, up = "ReleaseShelfDropdownDown", "ReleaseShelfDropdownUp"
     field, focus = "ReleaseShelfComboField", "ReleaseShelfComboFocus"
-    if indicator not in style.element_names():
+    if combo_arrow not in style.element_names():
         # Leave 8 px before the triangle and 12 px between it and the button edge.
         for image in (down, up):
             style.tk.call("image", "create", "photo", image, "-width", 31, "-height", 6)
-        style.element_create(indicator, "image", down, ("selected", up))
-        combo_arrow = "ReleaseShelf.comboArrow"
         style.element_create(combo_arrow, "image", down, ("pressed", up))
         # A square, fully painted field avoids clam's exposed corner pixels.
         for image in (field, focus):
@@ -241,7 +250,6 @@ def style_dropdowns(style, palette):
                 ("Combobox.textarea", {"sticky": "nswe"})]})]})])
         style.layout("TMenubutton", [("Menubutton.border", {"sticky": "nswe", "children": [
             ("Menubutton.focus", {"sticky": "nswe", "children": [
-                (indicator, {"side": "right", "sticky": ""}),
                 ("Menubutton.padding", {"sticky": "we", "children": [
                     ("Menubutton.label", {"side": "left", "sticky": ""})]})]})]})])
     for row in range(6):
@@ -333,15 +341,17 @@ def style_widgets(s, p):
                 postoffset=(0, 1, 0, -2))  # Overlap the field outline by 1 px in either direction.
     # Blend clam's bevel and inner focus ring into the fill. Only the outer
     # border changes color on hover or keyboard focus for every dropdown.
-    s.configure("TMenubutton", padding=(10, 7), background=p.surface, borderwidth=1,
+    s.configure("TMenubutton", padding=(10, 7, "23p", 7), background=p.surface, borderwidth=1,
                 bordercolor=p.line, lightcolor=p.surface, darkcolor=p.surface, focuscolor=p.surface)
     menu_fill = [("disabled", p.subtle), ("selected", p.surface), ("pressed", p.selection), ("active", p.subtle)]
     s.map("TMenubutton", background=menu_fill, lightcolor=menu_fill, darkcolor=menu_fill,
           focuscolor=menu_fill, foreground=[("disabled", p.muted)],
           bordercolor=[("disabled", p.line), ("selected", p.line), ("focus", p.accent), ("active", p.accent)])
+    s.configure("DropdownArrow.TLabel", font=HEADING_FONT, foreground=p.muted, background=p.surface)
+    s.map("DropdownArrow.TLabel", background=menu_fill)
     style_dropdowns(s, p)
-    s.configure("More.TMenubutton", padding=(10, 7, 0, 7), space=6)
-    s.configure("LanguagePicker.TMenubutton", padding=(12, 8), space=9, font=("Segoe UI Semibold", 10))
+    s.configure("More.TMenubutton", space=6)
+    s.configure("LanguagePicker.TMenubutton", space=9, font=("Segoe UI Semibold", 10))
     s.layout("LanguageItem.TButton", [("Button.border", {"sticky": "nsew", "border": 1,
               "children": [("Button.padding", {"sticky": "nsew"})]})])
     item_fill = [("selected", p.selection), ("focus", p.subtle)]
@@ -404,8 +414,8 @@ def style_widgets(s, p):
     # Reserve space for the overlaid count while allowing translated labels to grow.
     s.configure("Nav.TButton", background=p.subtle, anchor="w", width=-1, space=9, padding=(12, 9, 38, 9))
     s.configure("Compact.Nav.TButton", anchor="center", width=-1, padding=(9, 9))
-    nav_background = [("selected", p.selection), ("pressed", p.selection), ("active", p.surface)]
-    nav_foreground = [("selected", p.text)]
+    nav_background = [("disabled", p.subtle), ("selected", p.selection), ("pressed", p.selection), ("active", p.surface)]
+    nav_foreground = [("disabled", p.line), ("selected", p.text)]
     s.map("Nav.TButton", background=nav_background, foreground=nav_foreground)
     s.configure("Count.Nav.TLabel", background=p.subtle, foreground=p.muted, font=("Segoe UI Semibold", 9))
     s.map("Count.Nav.TLabel", background=nav_background, foreground=nav_foreground)
@@ -421,17 +431,19 @@ def style_widgets(s, p):
     s.configure("Treeview", rowheight=42, background=p.surface, foreground=p.text)
     s.configure("Categories.Treeview", rowheight=32, background=p.subtle, fieldbackground=p.subtle)
     s.configure("Treeview.Cell", padding=(TREE_TEXT_PAD, 0))
-    s.configure("Categories.Treeview.Cell", padding=(6, 0, TREE_TEXT_PAD, 0))
+    s.configure("Categories.Treeview.Cell", padding=0)
     # Center app icons and checklist boxes in the leading column of these flat tables.
     s.layout("Treeview.Item", [("Treeitem.image", {"sticky": ""})])
+    s.layout("Categories.Treeview.Item", [("Treeitem.padding", {"sticky": "nsew", "children": [
+        ("Treeitem.image", {"sticky": ""})]})])
+    s.configure("Categories.Treeview.Item", padding=(16, 0, 0, 0))
+    s.layout("Compact.Categories.Treeview.Item", [("Treeitem.image", {"sticky": ""})])
     # Keep tagged error text visible on the selection background.
     s.map("Treeview", background=[("selected", p.selection)], foreground=[])
     style_heading_dividers(s, p.line)
-    s.configure("Treeview.Heading", font=("Segoe UI Semibold", 9), background=p.canvas,
+    s.configure("Treeview.Heading", font=HEADING_FONT, background=p.canvas,
                 foreground=p.muted, padding=(TREE_TEXT_PAD, 8), relief="flat", borderwidth=0)
     s.map("Treeview.Heading", background=[("active", p.subtle)])
     s.configure("TScrollbar", background=p.subtle, troughcolor=p.surface, arrowcolor=p.muted,
                 arrowsize=11, borderwidth=0, lightcolor=p.subtle, darkcolor=p.subtle)
     s.map("TScrollbar", background=[("active", p.line)])
-    # The catalog card already draws the outer edge beside this scrollbar.
-    s.configure("Catalog.Vertical.TScrollbar", bordercolor=p.surface)

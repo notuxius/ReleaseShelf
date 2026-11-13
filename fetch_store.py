@@ -320,6 +320,7 @@ class Output:
 
 def matches(state, recipe, release):
     return (state is not None and state["version"] == release.version
+            and state.get("modified", "") == release.modified
             and recipe.matches_fingerprint(state.get("recipe"))
             and state.get("archive", recipe.archive) == release.archive
             and (not release.checksum or state["sha256"].get(release.archive) == release.checksum))
@@ -341,6 +342,8 @@ def download(root, recipe, release, on_progress=None, *, local_source=None):
         state = {"version": release.version, "release": release_id, "recipe": recipe.fingerprint(),
                  "archive": release.archive, "sha256": {name: digest(folder / name) for name in names},
                  "stats": {name: stamp(folder / name) for name in names}}
+        if release.modified:
+            state["modified"] = release.modified
         check_canceled()
         folder.rename(releases / release_id)
     return state

@@ -12,12 +12,12 @@ class _Scrollbar(ttk.Scrollbar):
             self.grid()
 
 
-def grid_scrollable(widget, *, horizontal=False, reserve_space=True, vertical_style=None):
+def grid_scrollable(widget, *, horizontal=False, reserve_space=True):
     parent = widget.master
     parent.rowconfigure(0, weight=1)
     parent.columnconfigure(0, weight=1)
     widget.grid(row=0, column=0, sticky="nsew")
-    vertical = _Scrollbar(parent, orient="vertical", command=widget.yview, style=vertical_style)
+    vertical = _Scrollbar(parent, orient="vertical", command=widget.yview)
     vertical.grid(row=0, column=1, sticky="nsew")
     widget.configure(yscrollcommand=vertical.set)
     if horizontal:
@@ -35,3 +35,4 @@ def grid_scrollable(widget, *, horizontal=False, reserve_space=True, vertical_st
     # Let ttk apply the window's theme before measuring the controls.
     if reserve_space:
         parent.after_idle(reserve_gutters)
+    return vertical

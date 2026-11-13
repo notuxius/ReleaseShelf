@@ -7,6 +7,7 @@ from math import ceil
 import os
 from pathlib import Path
 from queue import Empty, Queue
+import re
 import sys
 from threading import Event, Thread
 import tkinter as tk
@@ -14,16 +15,18 @@ from tkinter import font as tkfont, ttk
 from urllib.parse import urlsplit
 
 from checklist_window import ChecklistWindow
+from companion_buttons import install_and_restore
 from fetch_sources import Recipe
 from fetch_store import Result, apply_published_settings, read_state
 from recipe_editor import ACTIONS, ACTION_ICONS, RecipeEditor, save_recipe
-from releaseshelf import (ERRORS, MAX_PARALLEL_ITEMS, ChecklistLoadError, add_recipes_argument, batch_map, default_destination,
+from releaseshelf import (ERRORS, MAX_PARALLEL_ITEMS, UPDATE_RETRY_DELAYS, ChecklistLoadError,
+                          add_recipes_argument, batch_map, default_destination,
                           execute, load_targets, local_result, prepare_fetch, read_jobs, updates_disabled)
-from shelf_app_icons import load_app_icon
+from shelf_app_icons import ICON_SIZE, cache_store_logo, fetch_store_logo, load_app_icon, store_product_id
 from shelf_categories import MOVE, RENAME, CategoryDialog, change_category
 from shelf_checklist import Checklist, ChecklistHistory, LocalItem, catalog_item, run_checklist_step
 from shelf_checkboxes import checkbox_image, header_image
-from shelf_delete import DATA, DELETE, FOLDER, delete_item, deletion_plan
+from shelf_delete import DELETE, FOLDER, delete_item, deletion_plan
 from shelf_icons import category_icon, make_icon
 from shelf_i18n import set_language, tr
 from shelf_menu import AppMenu, DropdownMenu
@@ -32,15 +35,15 @@ from shelf_options import OptionsWindow, read_language
 from shelf_paint import keep_view_visible, show_window, stage_window
 from shelf_progress import DownloadProgress
 from shelf_scroll import grid_scrollable
-from shelf_text import CELL_TEXT_INSETS, FittedLabel, FittedTreeview
-from shelf_theme import (PALETTES, WINDOW_SIDE_PADDING, initial_geometry,
+from shelf_text import CELL_TEXT_INSETS, TK_CELL_INSETS, FittedLabel, FittedTreeview, fit_text
+from shelf_theme import (ARROW_DOWN, ARROW_UP, PALETTES, WINDOW_SIDE_PADDING, bind_button_badge, initial_geometry,
                         preference_path, read_appearance, style_titlebar, style_widgets, system_mode,
                         work_area, write_appearance, write_preference)
 from shelf_version import __version__
 
 
 APPLY_ACTIONS = {"apply_selected": "Apply selected", "apply_all": "Apply all items"}
-ALL_ACTIONS = {"check": "Check all items", "fetch": "Update all items", "verify": "Verify all items", **APPLY_ACTIONS}
+ALL_ACTIONS = {"fetch": "Update all items", "verify": "Verify all items", **APPLY_ACTIONS}
 BULK_ICONS = {**ACTION_ICONS, "apply_selected": "list_checks", "apply_all": "list_checks"}
 VIEWS = {"checklist": "Checklist", "all": "Tracked", "local": "Local only", "updates": "Available updates",
          "progress": "In progress", "attention": "Needs attention", "disabled": "Disabled"}
@@ -56,21 +59,19 @@ RESULT_STATUSES = ("Unknown", "Pending", "Error", "Latest", "Updated", "Cached",
 COLUMN_WIDTHS = {"Name": 126, "Category": 100, "Local version": 94,
                  "Available version": 115, "Status": 108, "Source": 110}
 SORTABLE_COLUMNS = ("Name", "Category", "Status")
-ARROW_UP = " ▲"
-ARROW_DOWN = " ▼"
 SEARCH_CHAR_LIMIT = 64
 INSTALLER_SUFFIXES = {".exe", ".msi", ".msix", ".msixbundle", ".appx", ".appxbundle"}
 ASSETS = Path(__file__).resolve().parent / "assets"
 
 
-DELETE_ICONS = {DELETE: "close", DATA: "file_x", FOLDER: "folder_x"}
+DELETE_ICONS = {DELETE: "close", FOLDER: "folder_x"}
 
 
 def deletion_dialog(parent, palette, mode, name, detail, paths=(), *, blocked=False):
     dialog = tk.Toplevel(parent)
     stage_window(dialog)
     dialog.transient(parent)
-    dialog.title(tr(mode))
+    dialog.title(tr("Delete entire app folder" if mode == FOLDER else mode))
     body = ttk.Frame(dialog, padding=16)
     body.pack(fill="both", expand=True)
     body.columnconfigure(0, weight=1)
@@ -137,6 +138,10 @@ def installer_path(job, dest):
     return None
 
 
+def display_app_version(version):
+    return re.sub(r"^[vV](?=[0-9])", "", str(version))
+
+
 def initial_result(job, dest, checklist_history):
     if isinstance(job, Result):
         return job
@@ -153,15 +158,16 @@ def initial_result(job, dest, checklist_history):
     local = current["version"] if current else "-"
     if pending:
         return Result("Pending", local, detail="Run Get updates to retry publication.")
-    return Result("Unknown", local, detail="Check for updates to see whether a newer version is available.")
+    return Result("Unknown", local)
 
 
-def run_batch(events, action, items, dest, targets_path):
+def run_batch(events, action, items, dest, targets_path, *, retry_delays=()):
     def check(item):
         index, (key, job, cancel_event) = item
         events.put(("started", key, "check" if action == "fetch" else action, index))
         if action == "fetch":
-            result = prepare_fetch(job, dest, targets, cancel_event=cancel_event)
+            result = prepare_fetch(job, dest, targets, cancel_event=cancel_event, retry_delays=retry_delays,
+                                   on_retry=lambda: events.put(("retry", key)))
             if not isinstance(result, Result):
                 events.put(("prepared", key))
                 return key, result, cancel_event
@@ -176,7 +182,7 @@ def run_batch(events, action, items, dest, targets_path):
         def progress(received, total):
             events.put(("progress", key, received, total))
 
-        result = plan.run(on_progress=progress, cancel_event=cancel_event)
+        result = plan.run(on_progress=progress, cancel_event=cancel_event, on_retry=lambda: events.put(("retry", key)))
         events.put(("result", key, result))
 
     try:
@@ -220,8 +226,10 @@ class ShelfWindow:
         self.busy = False
         self.requested_action = self.bulk_action = None
         self.install_key = None
+        self.installing = set()
         self.cancel_events = {}
         self.active_items = {}
+        self.retry_counts = {}
         self.transfers = {}
         self.editor = None
         self.options = None
@@ -245,6 +253,7 @@ class ShelfWindow:
             show_icons = False
         self.show_app_icons = tk.BooleanVar(root, value=show_icons)
         self.app_images = {}
+        self.store_icon_queue = {}
         self.language_file = self.appearance_file.with_name("language.txt")
         self.language = read_language(self.language_file)
         set_language(self.language)
@@ -284,7 +293,7 @@ class ShelfWindow:
         self.build_search(heading)
         self.table_area = ttk.Frame(body)
         self.table_area.grid(row=1, column=0, sticky="nsew")
-        card = ttk.Frame(self.table_area, style="Line.TFrame", padding=1)
+        card = ttk.Frame(self.table_area, style="Line.TFrame", padding=(1, 1, 0, 1))
         card.pack(fill="x")
         card.columnconfigure(0, weight=1)
         card.rowconfigure(2, weight=1)
@@ -294,8 +303,7 @@ class ShelfWindow:
         self.tree.bind("<Configure>", self.fit_table_rows, add="+")
         self.build_footer()
         self.captions = {widget: str(widget.cget("text")) for widget in (
-            *self.nav_buttons.values(),
-            self.options_button, self.search_clear, self.reset_search_button,
+            self.search_clear, self.reset_search_button,
             self.add_button, self.edit_button, self.more_button)}
         self.search.trace_add("write", self.search_changed)
         self.view.trace_add("write", self.view_changed)
@@ -373,7 +381,7 @@ class ShelfWindow:
             self.icon_widgets[button] = (nav_icons[name], "text", 20)
             count = ttk.Label(button, textvariable=self.view_counts[name], style="Count.Nav.TLabel")
             count.place(relx=1, rely=0.5, x=-10, anchor="e")
-            self.bind_nav_badge(button, count, lambda n=name: self.sync_nav_count(n))
+            bind_button_badge(button, count, lambda n=name: self.sync_nav_count(n))
             self.nav_counts[name] = count
 
         self.categories_file = self.appearance_file.with_name("categories-expanded.txt")
@@ -386,20 +394,34 @@ class ShelfWindow:
         self.icon_widgets[self.categories_button] = ("tags", "text", 20)
         self.categories_button.grid(row=len(VIEWS), column=0, sticky="ew", pady=2)
         self.categories_arrow = tk.Canvas(self.categories_button, highlightthickness=0, borderwidth=0, takefocus=0)
-        self.arrow_glyph = self.categories_arrow.create_text(0, 0, text=ARROW_DOWN.strip())
-        self.bind_nav_badge(self.categories_button, self.categories_arrow, self.sync_categories_arrow)
+        self.arrow_glyph = self.categories_arrow.create_text(0, 0, text=ARROW_DOWN)
+        bind_button_badge(self.categories_button, self.categories_arrow, self.sync_categories_button)
         self.sidebar_body = ttk.Frame(rail, style="Sidebar.TFrame")
         self.sidebar_body.grid(row=len(VIEWS) + 1, column=0, sticky="nsew")
         self.sidebar_body.columnconfigure(0, weight=1)
-        self.sidebar_body.rowconfigure(1, weight=1)
+        self.sidebar_body.rowconfigure(0, weight=1)
         self.category_panel = ttk.Frame(self.sidebar_body, style="Sidebar.TFrame")
-        self.category_panel.grid(row=0, column=0, sticky="new", padx=(16, 0))
-        self.category_list = FittedTreeview(self.category_panel, columns=("name", "count"), show="tree",
-                                            height=1, selectmode="browse", style="Categories.Treeview")
-        self.category_list.column("#0", width=20, minwidth=20, stretch=False)
+        self.category_panel.grid(row=0, column=0, sticky="new")
+        self.category_list = FittedTreeview(self.category_panel, columns=("name", "count", "gutter"), show="tree",
+                                            height=1, selectmode="browse", style="Categories.Treeview",
+                                            cell_insets=TK_CELL_INSETS)
+        self.category_list.column("#0", width=36, minwidth=36, stretch=False)
         self.category_list.column("name", width=80, minwidth=1)
         self.category_list.column("count", stretch=False, anchor="e")
-        grid_scrollable(self.category_list, reserve_space=False)
+        self.category_list.column("gutter", width=0, minwidth=0, stretch=False)
+        self.category_scrollbar = grid_scrollable(self.category_list, reserve_space=False)
+        self.category_list.grid_configure(row=1, columnspan=2)
+        self.category_scrollbar.grid_configure(row=1)
+        self.category_panel.rowconfigure(0, weight=0)
+        self.category_panel.rowconfigure(1, weight=1)
+        self.category_scroll_arrows = []
+        for row, glyph, step in ((0, ARROW_UP, -1), (2, ARROW_DOWN, 1)):
+            button = ttk.Button(self.category_panel, text=glyph, style="Compact.Nav.TButton", padding=(0, 1),
+                                command=lambda step=step: self.category_list.yview_scroll(step, "units"))
+            button.grid(row=row, column=0, columnspan=2, sticky="ew")
+            button.grid_remove()
+            self.category_scroll_arrows.append(button)
+        self.category_list.configure(yscrollcommand=self.sync_category_scroll)
         self.category_list.bind("<<TreeviewSelect>>", self.category_selected)
         self.category_menu = AppMenu(self.category_list)
         self.category_menu.add_action(RENAME, lambda: self.edit_category(rename=True), icon="edit")
@@ -420,21 +442,22 @@ class ShelfWindow:
         self.sidebar_body.bind("<Configure>", self.fit_category_rows)
 
         self.sidebar_hint = ttk.Label(self.root, style="SidebarHint.TLabel")
-        for button in (self.sidebar_toggle, *self.nav_buttons.values(), self.categories_button, self.options_button):
+        self.sidebar_labels = {button: (VIEWS[name], self.nav_counts[name]) for name, button in self.nav_buttons.items()}
+        self.sidebar_labels[self.categories_button] = ("Categories", self.categories_arrow)
+        self.sidebar_labels[self.options_button] = ("Options", None)
+        for button, (_, badge) in self.sidebar_labels.items():
+            button.bind("<Configure>", lambda _, b=button: self.fit_sidebar_button(b))
+            if badge is not None:
+                badge.bind("<Configure>", lambda _, b=button: self.fit_sidebar_button(b))
+        for button in (self.sidebar_toggle, *self.sidebar_labels):
             for event in ("<Enter>", "<FocusIn>"):
                 button.bind(event, self.show_sidebar_hint, add="+")
             for event in ("<Leave>", "<FocusOut>"):
                 button.bind(event, lambda _: self.sidebar_hint.place_forget(), add="+")
 
-    def bind_nav_badge(self, button, badge, sync):
-        for event in ("<Enter>", "<Leave>", "<ButtonPress-1>", "<ButtonRelease-1>"):
-            badge.bind(event, lambda e, seq=event: button.event_generate(
-                seq, x=e.x_root - button.winfo_rootx(), y=e.y_root - button.winfo_rooty(), state=e.state))
-        # ttk's class bindings set the button state after widget bindings run.
-        for event in ("<Enter>", "<Leave>", "<ButtonPress-1>", "<ButtonRelease-1>", "<space>", "<<Invoke>>"):
-            button.bind(event, lambda _: self.root.after_idle(sync), add="+")
-
-    def sync_categories_arrow(self):
+    def sync_categories_button(self):
+        selected = self.categories_expanded if self.sidebar_compact else self.view.get() in self.category_groups
+        self.categories_button.state(["selected" if selected else "!selected"])
         state = self.categories_button.state()
         self.categories_arrow.configure(background=self.style.lookup("Nav.TButton", "background", state))
 
@@ -448,10 +471,31 @@ class ShelfWindow:
             self.sidebar_grip.place(relx=1, anchor="ne", width=5, relheight=1, bordermode="outside")
             self.sidebar_toggle.grid(row=1, column=1, sticky="e", padx=(4, 0), pady=padding)
 
+    def fit_sidebar_button(self, button):
+        label, badge = self.sidebar_labels[button]
+        caption = tr(label)
+        if self.sidebar_compact:
+            button.configure(text=caption, padding="")
+            return
+        # Leave the icon at the same inset on every row. Only the caption shrinks.
+        right = 8 if badge is None else badge.winfo_reqwidth() + 14
+        padding = (12, 9, right, 9)
+        if tuple(map(int, button["padding"])) != padding:
+            button.configure(padding=padding)
+        if button.winfo_width() > 1 and button in self.images:
+            font = self.style.lookup("Nav.TButton", "font")
+            gap = int(self.style.lookup("Nav.TButton", "space"))
+            # The focus element takes one pixel on either side.
+            width = button.winfo_width() - 2 - padding[0] - right - self.images[button].width() - gap
+            caption = fit_text(button, font, caption, width)
+        if caption != button["text"]:
+            button.configure(text=caption)
+
     def show_sidebar_hint(self, event):
         button = event.widget
-        if button is self.sidebar_toggle or self.sidebar_compact:
-            self.sidebar_hint.configure(text=button.cget("text"))
+        full = button["text"] if button is self.sidebar_toggle else tr(self.sidebar_labels[button][0])
+        if button is self.sidebar_toggle or self.sidebar_compact or button["text"] != full:
+            self.sidebar_hint.configure(text=full)
             self.sidebar_hint.place(in_=button, relx=1, x=8, rely=0.5, anchor="w")
             self.sidebar_hint.lift()
 
@@ -497,9 +541,15 @@ class ShelfWindow:
         compact = self.sidebar_compact
         self.position_sidebar_toggle()
         self.sidebar_hint.place_forget()
-        for button in (*self.nav_buttons.values(), self.categories_button, self.options_button):
+        for button in self.sidebar_labels:
             button.configure(compound="image" if compact else "left",
                              style="Compact.Nav.TButton" if compact else "Nav.TButton")
+            self.fit_sidebar_button(button)
+        self.category_list.configure(displaycolumns=() if compact else "#all",
+                                     style="Compact.Categories.Treeview" if compact else "Categories.Treeview")
+        icon_width = self.categories_button.winfo_reqwidth() if compact else 36
+        self.category_list.column("#0", width=icon_width, minwidth=icon_width)
+        self.sync_category_scroll(*self.category_list.yview())
         self.position_categories()
         for count in self.nav_counts.values():
             if compact:
@@ -516,43 +566,55 @@ class ShelfWindow:
 
     def position_categories(self):
         if self.category_groups:
-            self.categories_button.configure(text=tr("Categories"))
             self.categories_button.grid()
+            self.sync_categories_button()
             if self.sidebar_compact:
                 self.categories_arrow.place_forget()
             else:
-                # The navigation style reserves trailing padding immediately after the caption.
-                right_padding = self.style.lookup("Nav.TButton", "padding")[2]
-                x = self.categories_button.winfo_reqwidth() - int(right_padding)
-                self.categories_arrow.place(x=x, rely=0.5, anchor="w")
                 self.categories_arrow.itemconfigure(self.arrow_glyph, angle=0 if self.categories_expanded else 90)
+                self.categories_arrow.place(relx=1, rely=0.5, x=-10, anchor="e")
         else:
             self.categories_button.grid_remove()
-        if self.category_groups and self.categories_expanded and not self.sidebar_compact:
+        if self.category_groups and self.categories_expanded:
             self.category_panel.grid()
-            self.sidebar_footer.grid_configure(sticky="ew")
             self.fit_category_rows()
         else:
             self.category_panel.grid_remove()
-            self.sidebar_footer.grid_configure(sticky="sew")
+
+    def sync_category_scroll(self, first, last):
+        if self.sidebar_compact:
+            self.category_scrollbar.grid_remove()
+            up, down = self.category_scroll_arrows
+            up.state(["disabled" if float(first) <= 0 else "!disabled"])
+            down.state(["disabled" if float(last) >= 1 else "!disabled"])
+        else:
+            self.category_scrollbar.set(first, last)
 
     def fit_category_rows(self, event=None):
-        if self.sidebar_compact or not self.category_groups:
+        if not self.category_groups:
             return
         available = self.sidebar_body.winfo_height() - self.sidebar_footer.winfo_reqheight()
         row_height = int(self.style.lookup("Categories.Treeview", "rowheight"))
-        rows = min(len(self.category_groups), max(0, available // row_height))
+        overflow = available < len(self.category_groups) * row_height
+        for button in self.category_scroll_arrows:
+            if self.sidebar_compact and overflow:
+                button.grid()
+                available -= button.winfo_reqheight()
+            else:
+                button.grid_remove()
+        rows = min(len(self.category_groups), max(0, (available + row_height - 1) // row_height))
+        # The count cell supplies four more pixels, for a 12-pixel right margin.
+        gutter = 8
+        if overflow and not self.sidebar_compact:
+            gutter += self.category_scrollbar.winfo_reqwidth()
+        if self.category_list.column("gutter", "width") != gutter:
+            self.category_list.column("gutter", width=gutter)
         if int(self.category_list.cget("height")) != rows:
             self.category_list.configure(height=rows)
 
     def toggle_categories(self):
-        if self.sidebar_compact:
-            self.categories_expanded = True
-            self.toggle_sidebar()
-            self.category_list.focus_set()
-        else:
-            self.categories_expanded = not self.categories_expanded
-            self.position_categories()
+        self.categories_expanded = not self.categories_expanded
+        self.position_categories()
         try:
             write_preference(self.categories_file, "expanded\n" if self.categories_expanded else "collapsed\n")
         except OSError as exc:
@@ -572,16 +634,15 @@ class ShelfWindow:
         listing = self.category_list
         font = tkfont.Font(root=self.root, font=self.style.lookup(listing.cget("style"), "font"))
         text_width = max((font.measure(str(len(keys))) for keys in groups.values()), default=0)
-        # Allow for the themed cell padding and Tk's insets on both sides of the text.
-        count_width = max(40, text_width + 32)
+        count_width = text_width + listing.cell_insets
         listing.column("count", width=count_width, minwidth=count_width)
         listing.delete(*listing.get_children())
         for view in sorted(groups, key=lambda v: self.view_title(v).casefold()):
             name = category_icon(view.removeprefix("category:"))
             if name not in self.category_images:
                 self.set_category_icon(name)
-            listing.insert("", "end", iid=view, tags=(name,))
-            listing.set_values(view, (self.view_title(view), len(groups[view])))
+            listing.insert("", "end", iid=view, text=self.view_title(view), tags=(name,))
+            listing.set_values(view, (self.view_title(view), len(groups[view]), ""))
         self.position_categories()
         if self.view.get() not in VIEWS and self.view.get() not in groups:
             self.view.set("all")
@@ -691,11 +752,9 @@ class ShelfWindow:
             state = ["selected" if name == view else "!selected"]
             button.state(state)
             self.sync_nav_count(name)
-        in_category = view in self.category_groups
-        self.categories_button.state(["selected" if in_category else "!selected"])
-        self.sync_categories_arrow()
+        self.sync_categories_button()
         listing = self.category_list
-        if in_category:
+        if view in self.category_groups:
             listing.selection_set(view)
             listing.focus(view)
             listing.see(view)
@@ -715,13 +774,13 @@ class ShelfWindow:
 
     def build_commands(self, card):
         bar = ttk.Frame(card, style="Surface.TFrame", padding=(9, 8))
-        bar.grid(row=0, column=0, sticky="ew")
+        bar.grid(row=0, column=0, sticky="ew", padx=(0, 1))
         bar.columnconfigure(0, weight=1)
         batch = ttk.Frame(bar, style="Surface.TFrame")
         batch.grid(row=0, column=0, sticky="w")
         self.all_buttons = {}
-        for action in ("check", "fetch", *APPLY_ACTIONS):
-            primary = action in ("check", "apply_selected")
+        for action in ("fetch", *APPLY_ACTIONS):
+            primary = action in ("fetch", "apply_selected")
             button = ttk.Button(batch, text=ALL_ACTIONS[action], command=lambda a=action: self.bulk_command(a),
                                 style="Primary.TButton" if primary else "Command.TButton", width=-1, compound="left")
             button.grid(row=0, column=0 if primary else 1, padx=(0, 5))
@@ -764,13 +823,14 @@ class ShelfWindow:
                 button.grid_remove()
 
     def build_table(self, card):
-        table = ttk.Frame(card, style="Surface.TFrame")
+        table = ttk.Frame(card, style="Line.TFrame")
+        # The scrollbar supplies the right edge when visible. Leave one pixel when hidden.
+        table.columnconfigure(1, minsize=1)
         table.grid(row=2, column=0, sticky="nsew")
         self.column_widths = COLUMN_WIDTHS.copy()
         cols = tuple(self.column_widths)
         show = ("tree", "headings") if self.show_app_icons.get() else "headings"
-        self.tree = FittedTreeview(table, columns=cols, show=show, selectmode="browse", height=4,
-                                   style="Catalog.Treeview")
+        self.tree = FittedTreeview(table, columns=cols, show=show, selectmode="browse", height=4)
         self.tree.column("#0", width=36, minwidth=36, stretch=False)
         self.tree.heading("#0", command=self.toggle_visible_checkboxes)
         self.tree.tk.call(self.tree, "heading", "#0", "state", "alternate")
@@ -779,7 +839,7 @@ class ShelfWindow:
             if name in SORTABLE_COLUMNS:
                 self.tree.heading(name, command=lambda column=name: self.sort_by(column))
             self.tree.column(name, minwidth=1, anchor="center")
-        grid_scrollable(self.tree, reserve_space=False, vertical_style="Catalog.Vertical.TScrollbar")
+        grid_scrollable(self.tree, reserve_space=False)
         self.row_bars = []
         for _ in range(MAX_PARALLEL_ITEMS):
             bar = ttk.Progressbar(self.tree, style="Download.Horizontal.TProgressbar", takefocus=False)
@@ -824,22 +884,19 @@ class ShelfWindow:
         tree = self.tree
         if not tree.winfo_ismapped():
             return
-        # Leave the card's one-pixel bottom border below the last complete row.
+        # Leave the card's one-pixel bottom border below the table.
         available = self.table_area.winfo_rooty() + self.table_area.winfo_height() - tree.winfo_rooty() - 1
-        normal_height = int(self.style.lookup("Treeview", "rowheight"))
-        row_height = int(self.style.lookup("Catalog.Treeview", "rowheight"))
+        row_height = int(self.style.lookup("Treeview", "rowheight"))
         current = int(tree["height"])
         heading = tree.winfo_reqheight() - current * row_height
-        body = max(1, available - heading)
+        body = available - heading
         count = len(tree.get_children())
-        if count and count * normal_height <= body:
-            rows, height = count, normal_height
+        if count:
+            # Request the partial row too. The card is clipped to the available pixels.
+            rows = min(count, max(1, (body + row_height - 1) // row_height))
         else:
-            rows = max(1, round(body / normal_height))
-            height = max(1, body // rows)
-        if height != row_height:
-            self.style.configure("Catalog.Treeview", rowheight=height)
-        if rows != current or height != row_height:
+            rows = max(1, body // row_height)
+        if rows != current:
             tree.configure(height=rows)
 
     def forward_row_pointer(self, event):
@@ -1053,6 +1110,8 @@ class ShelfWindow:
             self.set_status("Language changed for this session. Could not save preference: {error}", error=exc)
 
     def refresh_labels(self):
+        for button in self.sidebar_labels:
+            self.fit_sidebar_button(button)
         for widget, label in self.captions.items():
             widget.configure(text=tr(label))
         self.update_search_hint()
@@ -1074,12 +1133,14 @@ class ShelfWindow:
         self.checklist_status_width = max(row_font.measure(tr(s)) for s in
                                           ("Applied", "Not applied", "Partially applied", "Error")) + 36
         statuses = [tr(status) for status in (*RESULT_STATUSES, "Canceling…")]
+        total = len(UPDATE_RETRY_DELAYS)
+        statuses.append(tr("Retry {attempt}/{total}", attempt=total, total=total))
         statuses.extend(tr("{action}…", action=tr(action)) for action in (*WORKING.values(), "Downloading"))
         for name, width in COLUMN_WIDTHS.items():
             self.tree.column(name, minwidth=min_column_width)
             label = tr(name)
             if name in SORTABLE_COLUMNS:
-                label += ARROW_DOWN
+                label += " " + ARROW_DOWN
             if name == "Status":
                 width = max(width, max(row_font.measure(text) for text in statuses) + CELL_TEXT_INSETS)
             self.column_widths[name] = max(width, heading_font.measure(label) + 22)
@@ -1089,7 +1150,7 @@ class ShelfWindow:
         for name in COLUMN_WIDTHS:
             suffix = ""
             if name == self.visible_sort_column():
-                suffix = ARROW_DOWN if self.sort_descending else ARROW_UP
+                suffix = " " + (ARROW_DOWN if self.sort_descending else ARROW_UP)
             self.tree.set_caption(name, tr(name), suffix)
 
     def sort_by(self, column):
@@ -1136,8 +1197,57 @@ class ShelfWindow:
         if isinstance(self.jobs[key], (Checklist, ChecklistLoadError)):
             return  # Their first-column images come from the checklist tags.
         if key not in self.app_images:
-            self.app_images[key] = load_app_icon(self.root, self.jobs[key], self.dest)
+            job = self.jobs[key]
+            product = store_product_id(job)
+            icon = None
+            if product:
+                path = self.appearance_file.parent / "store-icons" / f"{product}.png"
+                try:
+                    icon = tk.PhotoImage(master=self.root, file=path, format="png")
+                except tk.TclError:
+                    if product not in self.store_icon_queue:
+                        self.store_icon_queue[product] = path
+                        if len(self.store_icon_queue) == 1:
+                            self.start_store_icon()
+            icon = icon or load_app_icon(self.root, job, self.dest)
+            if icon is None and isinstance(job, (Recipe, LocalItem)):
+                artwork = self.catalog / "icons" / (Path(key).stem + ".png")
+                if artwork.is_file():
+                    try:
+                        icon = tk.PhotoImage(master=self.root, file=artwork, format="png")
+                        if (icon.width(), icon.height()) != (ICON_SIZE, ICON_SIZE):
+                            icon = None
+                    except tk.TclError:
+                        pass
+            self.app_images[key] = icon
         self.tree.item(key, image=self.app_images[key] or self.app_column_icon)
+
+    def start_store_icon(self):
+        product = next(iter(self.store_icon_queue))
+        results = Queue()
+        Thread(target=fetch_store_logo, args=(product, results), daemon=True).start()
+        self.root.after(100, self.finish_store_icon, product, results)
+
+    def finish_store_icon(self, product, results):
+        try:
+            data = results.get_nowait()
+        except Empty:
+            self.root.after(100, self.finish_store_icon, product, results)
+            return
+        path = self.store_icon_queue.pop(product)
+        if data:
+            try:
+                icon = tk.PhotoImage(master=self.root, data=data, format="png")
+                for key, job in self.jobs.items():
+                    if store_product_id(job) == product:
+                        self.app_images[key] = icon
+                        if self.show_app_icons.get():
+                            self.tree.item(key, image=icon)
+                cache_store_logo(path, data)
+            except (tk.TclError, OSError):
+                pass
+        if self.store_icon_queue:
+            self.start_store_icon()
 
     def refresh_theme(self):
         if self.theme_timer is not None:
@@ -1152,12 +1262,12 @@ class ShelfWindow:
             return
         self.palette = palette
         style_widgets(self.style, palette)
-        arrow_font = self.style.lookup("Treeview.Heading", "font")
-        side = self.root.tk.getint(self.root.tk.call("font", "metrics", arrow_font, "-linespace"))
+        font = self.style.lookup("Treeview.Heading", "font")
+        side = self.root.tk.getint(self.root.tk.call("font", "metrics", font, "-linespace"))
         self.categories_arrow.configure(width=side, height=side)
         self.categories_arrow.coords(self.arrow_glyph, side / 2, side / 2)
-        self.categories_arrow.itemconfigure(self.arrow_glyph, font=arrow_font, fill=palette.text)
-        self.sync_categories_arrow()
+        self.categories_arrow.itemconfigure(self.arrow_glyph, font=font, fill=palette.text)
+        self.sync_categories_button()
         self.tree.tag_configure("error", foreground=palette.error)
         self.app_column_icon = make_icon(self.root, "picture_frame", palette.muted)
         self.refresh_checkbox_column()
@@ -1254,14 +1364,13 @@ class ShelfWindow:
         install = self.app_menu.buttons["Install"]
         cancel_install = cancel_action == "install"
         install.configure(text=tr("Cancel" if cancel_install else "Install"),
-                          state="normal" if cancel_install or (can_open and self.can_install(job)) else "disabled")
+                          state="normal" if cancel_install or (can_open and key not in self.installing and self.can_install(job)) else "disabled")
         self.app_menu.set_action_icon(install, "cancel" if cancel_install else "download", self.palette)
         self.app_menu.buttons["Open app folder"].state(["!disabled" if can_open else "disabled"])
         self.app_menu.buttons[MOVE].state(["!disabled" if can_open else "disabled"])
         self.app_menu.buttons["Edit item"].state(["disabled" if self.busy else "!disabled"])
         self.app_menu.buttons[DELETE].state(["disabled" if self.busy else "!disabled"])
-        for mode in (DATA, FOLDER):
-            self.app_menu.buttons[mode].state(["!disabled" if can_open else "disabled"])
+        self.app_menu.buttons[FOLDER].state(["!disabled" if can_open else "disabled"])
 
     def delete_selected_item(self, mode):
         key = self.app_menu_key
@@ -1274,11 +1383,11 @@ class ShelfWindow:
             plan = deletion_plan(mode, path, job, self.dest, self.targets)
             detail = [tr("All item files will be kept.")]
             paths = ()
-            if mode != DELETE:
+            if mode == FOLDER:
                 detail = [tr("These files and folders will be permanently deleted:")]
-                if mode == FOLDER and plan.folders:
+                if plan.folders:
                     detail.append(tr("Everything inside the listed folders will be lost."))
-                paths = (*plan.folders, path, *plan.files, *plan.manifests)
+                paths = (*plan.folders, path, *plan.manifests)
             if not deletion_dialog(self.root, self.palette, mode, name, "\n".join(detail), paths):
                 return
             try:
@@ -1377,6 +1486,26 @@ class ShelfWindow:
         try:
             path = installer_path(job, self.dest)
             if path and path.is_file():
+                if key in self.installing:
+                    return
+                if job.companions.after_install:
+                    settings = isinstance(job, Recipe) and job.has_portable_settings()
+                    if job.companions.script or settings:
+                        finished = Queue()
+
+                        def install():
+                            try:
+                                install_and_restore(path, job, Path(key), self.dest, settings)
+                            except Exception as exc:
+                                finished.put(error_detail(exc))
+                            else:
+                                finished.put(None)
+
+                        self.installing.add(key)
+                        Thread(target=install).start()
+                        self.root.after(150, self.finish_install, key, finished)
+                        self.set_status("Started {name}", name=path.name)
+                        return
                 os.startfile(path, cwd=path.parent)
                 self.set_status("Started {name}", name=path.name)
             elif fetch_missing and isinstance(job, Recipe) and not updates_disabled(job):
@@ -1388,19 +1517,37 @@ class ShelfWindow:
         except ERRORS as exc:
             self.set_status("{error}", error=error_detail(exc))
 
+    def finish_install(self, key, finished):
+        try:
+            error = finished.get_nowait()
+        except Empty:
+            self.root.after(150, self.finish_install, key, finished)
+            return
+        self.installing.discard(key)
+        if error is not None:
+            self.set_status("Could not finish: {error}", error=error)
+        else:
+            self.set_status("{label} finished  ·  {finished} of {total} processed",
+                            label=message("Install"), finished=1, total=1)
+        self.controls()
+
+    def app_folder(self, job):
+        if isinstance(job, LocalItem):
+            return job.path if job.path.is_dir() else job.path.parent
+        targets = load_targets(self.targets, self.dest)
+        mapped = next((targets[key] for key in job.id_keys() if key in targets), None)
+        if mapped:
+            return mapped.parent
+        state = read_state(job.cache_root(self.dest), "current.json") or {}
+        target = state.get("published", {}).get("path")
+        return Path(target).parent if target else None
+
     def open_app_folder(self):
         job = self.jobs.get(self.app_menu_key)
         if not isinstance(job, (LocalItem, Recipe)):
             return
         try:
-            if isinstance(job, LocalItem):
-                folder = job.path if job.path.is_dir() else job.path.parent
-            else:
-                targets = load_targets(self.targets, self.dest)
-                mapped = next((targets[key] for key in job.id_keys() if key in targets), None)
-                state = read_state(job.cache_root(self.dest), "current.json") or {}
-                target = mapped or state.get("published", {}).get("path")
-                folder = Path(target).parent if target else None
+            folder = self.app_folder(job)
             if not folder or not folder.is_dir():
                 self.set_status("Use Get updates to publish the app first.")
                 return
@@ -1444,7 +1591,8 @@ class ShelfWindow:
                                               self.checklist_history, self.checklist_result_changed)
             else:
                 self.editor = RecipeEditor(self.root, self.catalog, path, self.palette, self.recipe_saved,
-                                           on_action=on_action, categories=self.category_choices(), example=example)
+                                           on_action=on_action, categories=self.category_choices(), example=example,
+                                           get_app_folder=lambda: self.app_folder(self.jobs[str(path)]))
             self.editor.bind("<Destroy>", self.editor_closed, add="+")
             if path is not None:
                 self.update_app_info(str(path))
@@ -1507,7 +1655,9 @@ class ShelfWindow:
             if self.show_app_icons.get():
                 self.set_app_icon(key)
         self.refresh_categories()
-        if self.view.get() == "disabled" and not any(updates_disabled(job) for job in jobs.values()):
+        view = self.view.get()
+        if ((view == "local" and not any(isinstance(job, LocalItem) for job in jobs.values()))
+                or (view == "disabled" and not any(updates_disabled(job) for job in jobs.values()))):
             self.view.set("all")
         self.refresh_view(preferred=saved or next(iter(previous), None))
         self.set_status("Ready" if paths else "No items yet")
@@ -1527,7 +1677,7 @@ class ShelfWindow:
                                   and (group != "updates" or key not in groups["disabled"]))
         for group, keys in groups.items():
             self.view_counts[group].set(str(len(keys)))
-            if group in ("checklist", "all", "local") or keys:
+            if group in ("checklist", "all") or keys:
                 self.nav_buttons[group].grid()
             else:
                 self.nav_buttons[group].grid_remove()
@@ -1573,7 +1723,7 @@ class ShelfWindow:
             elif view == "all":
                 title, detail = "No tracked items yet", "Choose an example or add your own item."
             elif view == "updates":
-                title, detail = "No updates listed", "Select Check all items to compare versions with the publishers."
+                title, detail = "No updates listed", ""
             elif view == "progress":
                 title, detail = "No operations in progress", "Items being checked, updated, or verified appear here."
             else:
@@ -1616,11 +1766,15 @@ class ShelfWindow:
         if key in self.active_items:
             if self.cancel_events[key].is_set():
                 return tr("Canceling…")
+            if key in self.retry_counts:
+                return tr("Retry {attempt}/{total}", attempt=self.retry_counts[key], total=len(UPDATE_RETRY_DELAYS))
             action = "Downloading" if key in self.transfers else WORKING[self.active_items[key][0]]
             return tr("{action}…", action=tr(action))
         status = self.results[key].status
         if updates_disabled(self.jobs[key]) and status in ("Unknown", "Update available", "Latest"):
             return tr("Disabled")
+        if status == "Unknown" and key in self.cancel_events and self.requested_action in ("fetch", "install"):
+            return tr("Pending")
         return tr(status)
 
     def shows_error(self, key):
@@ -1645,8 +1799,8 @@ class ShelfWindow:
             source = tr("Local only")
         elif isinstance(job, Recipe):
             source = urlsplit(job.page or job.download).hostname if not job.github else "github.com"
-        local = "—" if result.local == "-" else result.local
-        available = "—" if result.available == "-" else result.available
+        local = "—" if result.local == "-" else display_app_version(result.local)
+        available = "—" if result.available == "-" else display_app_version(result.available)
         values = (self.name(key), self.category(key), local, available, self.displayed_status(key), source)
         self.refresh_row_tags(key)
         self.tree.set_values(key, values)
@@ -1662,8 +1816,8 @@ class ShelfWindow:
         if isinstance(job, Recipe):
             if job.description:
                 lines = [job.description, "", *lines]
-            lines += [tr("Local version: {value}", value=result.local),
-                      tr("Available version: {value}", value=result.available),
+            lines += [tr("Local version: {value}", value=display_app_version(result.local)),
+                      tr("Available version: {value}", value=display_app_version(result.available)),
                       tr("Source: {value}", value=job.page or job.github or job.download)]
             try:
                 lines.append(tr("Cache: {value}", value=job.cache_root(self.dest)))
@@ -1721,6 +1875,7 @@ class ShelfWindow:
         idle_state = "disabled" if self.busy else "normal"
         self.more_menu.buttons["Reload"].configure(state=idle_state)
         self.more_button.configure(state="normal" if self.bulk_action == "verify" else idle_state)
+        self.more_menu.sync_arrow()
         self.add_button.configure(state=idle_state)
         for button in self.example_choices.winfo_children():
             button.configure(state=idle_state)
@@ -1770,14 +1925,20 @@ class ShelfWindow:
         self.total, self.finished, self.canceled, self.failure = len(keys), 0, 0, ""
         self.pending_downloads = set()
         self.download_index = 0
-        self.controls()
+        if action == "fetch":
+            for recipe_key in keys:
+                if self.results[recipe_key].status == "Unknown":
+                    self.paint(recipe_key)
+        self.refresh_view(select_first=False)
         items = [(k, self.jobs[k], token) for k, token in self.cancel_events.items()]
         if action in APPLY_ACTIONS:
             self.set_status("{action}…", action=message("Applying"))
             Thread(target=run_checklists, args=(self.events, items, self.checklist_history)).start()
         else:
             self.set_status("{action}…", action=message(WORKING[action]))
-            Thread(target=run_batch, args=(self.events, action, items, self.dest, self.targets)).start()
+            delays = UPDATE_RETRY_DELAYS if self.bulk_action == "fetch" else ()
+            Thread(target=run_batch, args=(self.events, action, items, self.dest, self.targets),
+                   kwargs={"retry_delays": delays}).start()
         label = ALL_ACTIONS[action] if key is None else ACTIONS[action]
         if install:
             label = "Install"
@@ -1811,6 +1972,11 @@ class ShelfWindow:
                 del self.active_items[key]
                 self.paint(key)
                 view_changed = True
+            elif event == "retry":
+                key, = data
+                self.retry_counts[key] = self.retry_counts.get(key, 0) + 1
+                self.paint(key)
+                view_changed |= self.sort_column == "Status"
             elif event == "progress":
                 key, received, total = data
                 was_downloading = key in self.transfers
@@ -1828,6 +1994,7 @@ class ShelfWindow:
             elif event == "result":
                 key, result = data
                 self.active_items.pop(key, None)
+                self.retry_counts.pop(key, None)
                 self.transfers.pop(key, None)
                 self.pending_downloads.discard(key)
                 if key == self.install_key and self.cancel_events[key].is_set():
@@ -1852,6 +2019,7 @@ class ShelfWindow:
                     self.editor.error.set(tr("Could not finish: {error}", error=tr(self.failure)))
             else:
                 self.active_items.clear()
+                self.retry_counts.clear()
                 self.transfers.clear()
                 self.working_status()
                 self.position_row_progress()
@@ -1880,7 +2048,7 @@ class ShelfWindow:
                 return
 
     def close(self):
-        if self.busy or (isinstance(self.editor, ChecklistWindow) and self.editor.running):
+        if self.busy or self.installing or (isinstance(self.editor, ChecklistWindow) and self.editor.running):
             self.set_status("An operation is running. Close the window after it finishes.")
         else:
             self.track_window()

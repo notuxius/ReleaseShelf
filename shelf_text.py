@@ -5,7 +5,8 @@ from tkinter import ttk
 
 TREE_TEXT_PAD = 10
 # Tk 8.6 DrawCells insets the cell by four pixels per side before applying the theme.
-CELL_TEXT_INSETS = 2 * (TREE_TEXT_PAD + 4)
+TK_CELL_INSETS = 8
+CELL_TEXT_INSETS = 2 * TREE_TEXT_PAD + TK_CELL_INSETS
 
 
 def fit_text(widget, font, text, width, suffix=""):
@@ -109,8 +110,9 @@ class FittedLabel(ttk.Label):
 class FittedTreeview(ttk.Treeview):
     """Keep the original captions so wider columns can reveal the full text."""
 
-    def __init__(self, master, **options):
+    def __init__(self, master, *, cell_insets=CELL_TEXT_INSETS, **options):
         super().__init__(master, **options)
+        self.cell_insets = cell_insets
         self.rows = {}
         self.captions = {}
         self.widths = ()
@@ -124,6 +126,8 @@ class FittedTreeview(ttk.Treeview):
     def clipped_text_at(self, x, y):
         region = self.identify_region(x, y)
         display_col = self.identify_column(x)
+        if region == "tree" and not self["displaycolumns"]:
+            return self.item(self.identify_row(y), "text")
         if region not in ("heading", "cell") or display_col in ("", "#0"):
             return
         col = self.column(display_col, "id")
@@ -179,7 +183,7 @@ class FittedTreeview(ttk.Treeview):
 
     def draw_row(self, row, values):
         if self.widths:
-            values = tuple(fit_text(self, self.row_font, str(value), width - CELL_TEXT_INSETS)
+            values = tuple(fit_text(self, self.row_font, str(value), width - self.cell_insets)
                            for value, width in zip(values, self.widths, strict=True))
         self.item(row, values=values)
 

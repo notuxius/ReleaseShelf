@@ -8,9 +8,10 @@ import zipfile
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from http.client import HTTPException
 from pathlib import Path
+from time import sleep
 
 from fetch_sources import Recipe, Release, filename
 from fetch_store import Result, fetch_lock, matches, read_state, run_release, verify
@@ -24,6 +25,7 @@ ERRORS = (OSError, ValueError, LookupError, TypeError, AttributeError, re.error,
 APP_DIR = Path(sys.executable if getattr(sys, "frozen", False) else __file__).resolve().parent
 DEFAULT_CATALOG = APP_DIR / "recipes"
 MAX_PARALLEL_ITEMS = 3
+UPDATE_RETRY_DELAYS = (1, 2, 4)
 
 
 def batch_map(action, worker, items):
@@ -136,7 +138,8 @@ def main(argv=None):
 
     def process(item):
         path, job = item
-        return path, job, execute(args.action, job, dest, targets)
+        delays = UPDATE_RETRY_DELAYS if args.all and args.action == "fetch" else ()
+        return path, job, execute(args.action, job, dest, targets, retry_delays=delays)
 
     results = batch_map(args.action, process, jobs) if args.all else map(process, jobs)
     for path, job, result in results:
@@ -187,6 +190,7 @@ class PreparedDownload:
     target: Path | None
     release: Release
     generations: tuple
+    retry_delays: tuple = ()
 
     def can_reuse_release(self, root, current):
         # A competing fetch may have published or journaled a newer release while this one waited.
@@ -196,22 +200,48 @@ class PreparedDownload:
                 return False
         return True
 
-    def run(self, on_progress=None, *, cancel_event=None):
+    def run(self, on_progress=None, *, cancel_event=None, on_retry=None):
         try:
             with cancel_scope(cancel_event):
-                return run_job("fetch", self.job, self.dest, self.target, on_progress, prepared=self)
+                return fetch_with_retries(self.job, self.dest, self.target, on_progress, cancel_event,
+                                          self.retry_delays, prepared=self, on_retry=on_retry)
         except JobCanceled:
             return Result("Canceled")
         except ERRORS as exc:
             return Result("Error", detail=error_detail(exc))
 
 
-def prepare_fetch(job, dest, targets, *, cancel_event=None):
+def fetch_with_retries(job, dest, target, on_progress, cancel_event, delays, *,
+                       prepared=None, defer_download=False, on_retry=None):
+    while True:
+        check_canceled()
+        try:
+            result = run_job("fetch", job, dest, target, on_progress, prepared=prepared, defer_download=defer_download)
+        except ERRORS as exc:
+            result = Result("Error", detail=error_detail(exc))
+        if isinstance(result, PreparedDownload):
+            return replace(result, retry_delays=delays)
+        if result.status not in {"Source error", "Error"} or not delays:
+            return result
+        delay, delays = delays[0], delays[1:]
+        if on_retry is not None:
+            on_retry()
+        if cancel_event is None:
+            sleep(delay)
+        else:
+            cancel_event.wait(delay)
+        # Refresh the publisher URL in case the previous download link expired.
+        prepared = None
+
+
+def prepare_fetch(job, dest, targets, *, cancel_event=None, retry_delays=(), on_retry=None):
     """Complete local work now, or queue the resolved release for a network download."""
-    return execute("fetch", job, dest, targets, cancel_event=cancel_event, defer_download=True)
+    return execute("fetch", job, dest, targets, cancel_event=cancel_event,
+                   defer_download=True, retry_delays=retry_delays, on_retry=on_retry)
 
 
-def execute(action, job, dest, targets, on_progress=None, cancel_event=None, *, defer_download=False):
+def execute(action, job, dest, targets, on_progress=None, cancel_event=None, *,
+            defer_download=False, retry_delays=(), on_retry=None):
     try:
         with cancel_scope(cancel_event):
             if isinstance(job, Result):
@@ -228,7 +258,10 @@ def execute(action, job, dest, targets, on_progress=None, cancel_event=None, *, 
                                          "Keep one mapping for this item in the targets file.",
                                          app=job.id, keys=", ".join(keys)))
             target = targets[keys[0]] if keys else None
-            return run_job(action, job, dest, target, on_progress, defer_download=defer_download)
+            if action == "fetch":
+                return fetch_with_retries(job, dest, target, on_progress, cancel_event, retry_delays,
+                                          defer_download=defer_download, on_retry=on_retry)
+            return run_job(action, job, dest, target, on_progress)
     except JobCanceled:
         return Result("Canceled")
     except ERRORS as exc:
