@@ -1683,7 +1683,7 @@ class DesktopTest(unittest.TestCase):
         self.assertFalse(up.winfo_viewable() or down.winfo_viewable())
 
         recipe = json.loads(Path(self.keys[0]).read_text())
-        for number in range(15):
+        for number in range(8):
             recipe.update(id=f"tool-{number}", category=f"Group {number:02}")
             (ui.catalog / f"tool-{number}.json").write_text(json.dumps(recipe))
         ui.reload()
@@ -1717,7 +1717,7 @@ class DesktopTest(unittest.TestCase):
         self.assertTrue(down.instate(["disabled"]))
         self.assertTrue(up.instate(["!disabled"]))
 
-        self.root.geometry("1120x900")
+        self.root.geometry("1120x680")
         self.root.update()
         self.assertFalse(up.winfo_viewable() or down.winfo_viewable())
         self.assertTrue(up.instate(["disabled"]) and down.instate(["disabled"]))
