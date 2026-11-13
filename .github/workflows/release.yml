@@ -19,6 +19,8 @@ jobs:
         run: |
           $version = python -c "from shelf_version import __version__; print(__version__)"
           if ($env:GITHUB_REF_NAME -cne "v$version") { throw "Tag must match shelf_version.py" }
+          $notes = Get-Content -LiteralPath "release-notes/$env:GITHUB_REF_NAME.md" -Raw -ErrorAction Stop
+          if ([string]::IsNullOrWhiteSpace($notes)) { throw "Release notes are empty for $env:GITHUB_REF_NAME" }
       - name: Run tests
         run: python run_tests.py
       - name: Install PyInstaller
@@ -28,4 +30,4 @@ jobs:
       - name: Publish executable
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$env:GITHUB_REF_NAME" "dist/ReleaseShelf.exe" --verify-tag --generate-notes --title "ReleaseShelf $env:GITHUB_REF_NAME"
+        run: gh release create "$env:GITHUB_REF_NAME" "dist/ReleaseShelf.exe" --verify-tag --notes-file "release-notes/$env:GITHUB_REF_NAME.md" --title "ReleaseShelf $env:GITHUB_REF_NAME"
