@@ -4,12 +4,12 @@ import tkinter as tk
 
 from shelf_icons import tinted_strip
 
-MIXED = "ReleaseShelfCheckboxMixed"
+MIXED = "RelfCheckboxMixed"
 
 
 def checkbox_image(checked=False, disabled=False):
     state = "On" if checked else "Off"
-    return "ReleaseShelfCheckbox" + state + ("Disabled" if disabled else "")
+    return "RelfCheckbox" + state + ("Disabled" if disabled else "")
 
 
 def header_image(checked, total, disabled=False):
@@ -24,7 +24,7 @@ def style_checkboxes(style, palette):
     accent = palette.tab_indicator or palette.accent
     for suffix, outline, fill in (("", palette.muted, accent), ("Disabled", palette.line, palette.muted)):
         for index, (state, color) in enumerate((("Off", outline), ("On", fill), ("Mixed", fill))):
-            name = "ReleaseShelfCheckbox" + state + suffix
+            name = "RelfCheckbox" + state + suffix
             if name not in names:
                 style.tk.call("image", "create", "photo", name)
             strip = tk.PhotoImage(master=style.master, data=tinted_strip("checkboxes.png", color), format="png")
@@ -34,7 +34,7 @@ def style_checkboxes(style, palette):
             if name + "Header" not in names:
                 style.tk.call("image", "create", "photo", name + "Header")
             style.tk.call(name + "Header", "copy", name, "-from", 4, 2, 20, 18, "-compositingrule", "set")
-    indicator = "ReleaseShelf.checkbox"
+    indicator = "Relf.checkbox"
     if indicator not in style.element_names():
         style.element_create(indicator, "image", checkbox_image(),
                              ("disabled", "alternate", MIXED + "Disabled"),

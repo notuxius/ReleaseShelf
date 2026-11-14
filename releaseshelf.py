@@ -1,4 +1,4 @@
-"""ReleaseShelf: check publishers, fetch portable apps, or verify local files."""
+"""Relf: check publishers, fetch portable apps, or verify local files."""
 
 import argparse
 import json
@@ -42,8 +42,11 @@ def updates_disabled(job):
 
 def default_destination():
     downloads = Path.home() / "Downloads"
-    legacy = downloads / "PortableFetch"
-    return legacy if legacy.is_dir() else downloads / "ReleaseShelf"
+    for name in ("PortableFetch", "ReleaseShelf"):
+        legacy = downloads / name
+        if legacy.is_dir():
+            return legacy
+    return downloads / "Relf"
 
 
 def load_targets(path, dest):
@@ -247,7 +250,7 @@ def execute(action, job, dest, targets, on_progress=None, cancel_event=None, *,
             if isinstance(job, Result):
                 return job
             if isinstance(job, Checklist):
-                return Result("Error", detail="Open the setup checklist in ReleaseShelf to choose adjustments.")
+                return Result("Error", detail="Open the setup checklist in Relf to choose adjustments.")
             if isinstance(job, LocalItem):
                 return local_result(job)
             if action in ("check", "fetch") and job.updates_disabled:

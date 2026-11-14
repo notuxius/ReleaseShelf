@@ -1,4 +1,4 @@
-"""Appearance settings and ttk palettes for the ReleaseShelf desktop window."""
+"""Appearance settings and ttk palettes for the Relf desktop window."""
 
 import ctypes
 from ctypes import wintypes
@@ -93,7 +93,9 @@ PALETTES = {
 
 def preference_path():
     base = os.environ.get("LOCALAPPDATA") or Path.home() / ".config"
-    return Path(base) / "ReleaseShelf" / "appearance.txt"
+    legacy = Path(base) / "ReleaseShelf"
+    directory = legacy if legacy.is_dir() else Path(base) / "Relf"
+    return directory / "appearance.txt"
 
 
 def read_appearance(path):
@@ -196,12 +198,12 @@ def initial_geometry(window, width, height, *, parent=None):
 
 
 def style_heading_dividers(style, color):
-    element = "ReleaseShelf.headingDivider"
-    bottom = "ReleaseShelf.headingBottom"
-    right_line = "ReleaseShelfHeadingRightLine"
-    bottom_line = "ReleaseShelfHeadingBottomLine"
+    element = "Relf.headingDivider"
+    bottom = "Relf.headingBottom"
+    right_line = "RelfHeadingRightLine"
+    bottom_line = "RelfHeadingBottomLine"
     if element not in style.element_names():
-        blank = "ReleaseShelfHeadingBlank"
+        blank = "RelfHeadingBlank"
         # ttk tiles image elements. Paint typical heading edges in one blit
         # while keeping their requested thickness and minimum length at 1 px.
         for image, width, height in ((blank, 1, 64), (right_line, 1, 64), (bottom_line, 256, 1)):
@@ -230,9 +232,9 @@ def bind_button_badge(button, badge, sync):
         button.bind(event, lambda _: button.after_idle(sync), add="+")
 
 def style_dropdowns(style, palette):
-    combo_arrow = "ReleaseShelf.comboArrow"
-    down, up = "ReleaseShelfDropdownDown", "ReleaseShelfDropdownUp"
-    field, focus = "ReleaseShelfComboField", "ReleaseShelfComboFocus"
+    combo_arrow = "Relf.comboArrow"
+    down, up = "RelfDropdownDown", "RelfDropdownUp"
+    field, focus = "RelfComboField", "RelfComboFocus"
     if combo_arrow not in style.element_names():
         # Leave 8 px before the triangle and 12 px between it and the button edge.
         for image in (down, up):
@@ -241,7 +243,7 @@ def style_dropdowns(style, palette):
         # A square, fully painted field avoids clam's exposed corner pixels.
         for image in (field, focus):
             style.tk.call("image", "create", "photo", image, "-width", 64, "-height", 32)
-        combo_field = "ReleaseShelf.comboField"
+        combo_field = "Relf.comboField"
         style.element_create(combo_field, "image", field, ("pressed", focus), ("focus", focus),
                              ("active", focus), border=1, width=1, height=1, sticky="nsew")
         style.layout("TCombobox", [(combo_field, {"sticky": "nswe", "children": [
@@ -292,8 +294,8 @@ def category_picker(parent, variable, choices, *, width):
 
 def style_editor_tabs(style, palette):
     tab = "Editor.TNotebook.Tab"
-    face = "ReleaseShelf.editorTab"
-    normal, hover, selected = "ReleaseShelfTabNormal", "ReleaseShelfTabHover", "ReleaseShelfTabSelected"
+    face = "Relf.editorTab"
+    normal, hover, selected = "RelfTabNormal", "RelfTabHover", "RelfTabSelected"
     if face not in style.element_names():
         # Tk tiles the image for every repaint. Cover a typical tab in one or
         # two blits while letting the caption determine the actual tab size.

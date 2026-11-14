@@ -26,8 +26,8 @@ jobs:
       - name: Install PyInstaller
         run: python -m pip install pyinstaller==6.22.3
       - name: Build executable
-        run: python -m PyInstaller --noconfirm ReleaseShelf.spec
+        run: python -m PyInstaller --noconfirm Relf.spec
       - name: Publish executable
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$env:GITHUB_REF_NAME" "dist/ReleaseShelf.exe" --verify-tag --notes-file "release-notes/$env:GITHUB_REF_NAME.md" --title "ReleaseShelf $env:GITHUB_REF_NAME"
+        run: gh release create "$env:GITHUB_REF_NAME" "dist/Relf.exe" --verify-tag --notes-file "release-notes/$env:GITHUB_REF_NAME.md" --title "Relf $env:GITHUB_REF_NAME"

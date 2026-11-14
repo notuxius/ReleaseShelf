@@ -14,7 +14,7 @@ def use_test_desktop():
                                       wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p]
     user32.CreateDesktopW.restype = wintypes.HANDLE
     user32.SetThreadDesktop.argtypes = [wintypes.HANDLE]
-    name = f"ReleaseShelfTests-{uuid.uuid4().hex}"
+    name = f"RelfTests-{uuid.uuid4().hex}"
     desktop = user32.CreateDesktopW(name, None, None, 0, 0x01FF, None)
     if not desktop or not user32.SetThreadDesktop(desktop):
         raise ctypes.WinError(ctypes.get_last_error())

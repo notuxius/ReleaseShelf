@@ -1,4 +1,4 @@
-"""Double-click launcher for the ReleaseShelf desktop catalog."""
+"""Compatibility launcher for the Relf desktop app."""
 
 from shelf_window import main
 

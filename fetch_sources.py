@@ -1,4 +1,4 @@
-"""Resolve publisher versions and validate downloads for ReleaseShelf."""
+"""Resolve publisher versions and validate downloads for Relf."""
 
 import ctypes
 import fnmatch
@@ -86,7 +86,7 @@ class CheckedRedirect(HTTPRedirectHandler):
 
 
 def open_url(url, *, method=None, data=None, headers=None):
-    request = Request(source_url(url), headers={"User-Agent": f"ReleaseShelf/{__version__}", **(headers or {})},
+    request = Request(source_url(url), headers={"User-Agent": f"Relf/{__version__}", **(headers or {})},
                       method=method, data=data)
     return build_opener(CheckedRedirect()).open(request, timeout=30)
 

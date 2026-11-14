@@ -1,4 +1,4 @@
-"""Language and appearance controls for the ReleaseShelf desktop app."""
+"""Language and appearance controls for the Relf desktop app."""
 
 import tkinter as tk
 from tkinter import ttk

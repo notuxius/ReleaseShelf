@@ -1,4 +1,4 @@
-"""Compatibility entry point for ReleaseShelf."""
+"""Compatibility entry point for Relf."""
 
 from releaseshelf import main, run_cli
 

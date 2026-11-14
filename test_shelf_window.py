@@ -1387,7 +1387,7 @@ class DesktopTest(unittest.TestCase):
     @unittest.skipUnless(sys.platform == "win32", "Windows icon resources")
     def test_zip_supplies_packaged_ico_without_an_executable(self):
         from shelf_app_icons import _executable_icon, _zip_icon
-        source = Path(__file__).parent / "assets" / "releaseshelf.ico"
+        source = Path(__file__).parent / "assets" / "relf.ico"
         archive = self.ui.catalog / "scripts.zip"
         with zipfile.ZipFile(archive, "w") as package:
             package.write(source, "resources/app.ico")

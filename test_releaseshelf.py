@@ -23,7 +23,8 @@ import zipfile
 
 from fetch_sources import Recipe, copy_with_progress, windows_product_version
 from fetch_store import digest, write_state
-from releaseshelf import execute
+from releaseshelf import default_destination, execute
+from shelf_theme import preference_path
 
 
 PROJECT = Path(__file__).resolve().parent
@@ -38,7 +39,21 @@ class Publisher(SimpleHTTPRequestHandler):
         pass
 
 
-class ReleaseShelfTest(unittest.TestCase):
+class RelfTest(unittest.TestCase):
+    def test_renamed_storage_preserves_existing_folders(self):
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp)
+            downloads = home / "Downloads"
+            downloads.mkdir()
+            with patch.object(Path, "home", return_value=home), patch.dict(os.environ, LOCALAPPDATA=temp):
+                self.assertEqual(default_destination(), downloads / "Relf")
+                self.assertEqual(preference_path(), home / "Relf" / "appearance.txt")
+                for name in ("ReleaseShelf", "PortableFetch"):
+                    (downloads / name).mkdir()
+                    self.assertEqual(default_destination(), downloads / name)
+                (home / "ReleaseShelf").mkdir()
+                self.assertEqual(preference_path(), home / "ReleaseShelf" / "appearance.txt")
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(dir=Path(tempfile.gettempdir()).resolve())
         self.addCleanup(self.temp.cleanup)
@@ -286,7 +301,7 @@ class ReleaseShelfTest(unittest.TestCase):
 
     def cli(self, action, *, success=True, batch=None, expected_code=None):
         selection = ["--all", "--catalog", str(batch)] if batch else [str(self.recipe_file)]
-        args = [str(PROJECT / "releaseshelf.py"), action, *selection, "--dest", str(self.dest)]
+        args = [str(PROJECT / "relf.py"), action, *selection, "--dest", str(self.dest)]
         if self.use_http:
             result = subprocess.run([sys.executable, *args], capture_output=True, text=True, timeout=15)
             if expected_code is not None:

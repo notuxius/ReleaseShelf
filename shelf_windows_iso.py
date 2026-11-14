@@ -162,7 +162,7 @@ def open_windows_iso(version, checksum):
             yield source
             return
 
-    request = Request(windows_iso_url(version), headers={"User-Agent": f"ReleaseShelf/{__version__}"})
+    request = Request(windows_iso_url(version), headers={"User-Agent": f"Relf/{__version__}"})
     check_canceled()
     try:
         response = build_opener(MicrosoftRedirect()).open(request, timeout=30)

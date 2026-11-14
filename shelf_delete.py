@@ -99,7 +99,7 @@ def deletion_plan(mode, path, job, dest, targets):
         resolved = target.resolve()
         if (resolved == Path(resolved.anchor) or any(p.is_relative_to(resolved) for p in protected)
                 or (resolved.parent == path.parent.resolve() and resolved.suffix.lower() == ".json")):
-            raise ValueError(f"Cannot delete ReleaseShelf storage or a protected folder: {target}")
+            raise ValueError(f"Cannot delete Relf storage or a protected folder: {target}")
     return Deletion(tuple(sorted(folders)), tuple(manifests), cache)
 
 

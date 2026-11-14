@@ -1,4 +1,4 @@
-"""ReleaseShelf desktop app."""
+"""Relf desktop app."""
 
 import argparse
 import ctypes
@@ -234,11 +234,11 @@ class ShelfWindow:
         self.editor = None
         self.options = None
         self.events = Queue()
-        root.title("ReleaseShelf")
+        root.title("Relf")
         if sys.platform == "win32":
-            root.iconbitmap(default=str(ASSETS / "releaseshelf.ico"))
+            root.iconbitmap(default=str(ASSETS / "relf.ico"))
         else:
-            root.iconphoto(True, tk.PhotoImage(master=root, file=ASSETS / "releaseshelf-32.png"))
+            root.iconphoto(True, tk.PhotoImage(master=root, file=ASSETS / "relf-32.png"))
         root.protocol("WM_DELETE_WINDOW", self.close)
         root.columnconfigure(0, weight=1)
         root.rowconfigure(0, weight=1)
@@ -2070,7 +2070,7 @@ def main():
     args = parser.parse_args()
     dest = (args.dest or default_destination()).resolve()
     if sys.platform == "win32":
-        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("ReleaseShelf.Desktop")
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("Relf.Desktop")
     root = tk.Tk()
     stage_window(root)
     ShelfWindow(root, args.recipes.resolve(), dest, args.targets or dest / "targets.json")

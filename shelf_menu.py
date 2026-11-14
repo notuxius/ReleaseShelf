@@ -1,4 +1,4 @@
-"""Shared popup menus for ReleaseShelf commands and choices."""
+"""Shared popup menus for Relf commands and choices."""
 
 import tkinter as tk
 from tkinter import ttk
