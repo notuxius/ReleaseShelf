@@ -8,7 +8,7 @@ Batch checks and downloads run up to three items at a time. Each active download
 
 ## Run it
 
-Download `Relf.exe` from [GitHub Releases](https://github.com/notuxius/Relf/releases) when the first Relf release is available. Earlier releases contain `ReleaseShelf.exe`. Place it in a writable folder and double-click it. The executable includes Python. Saving your first item creates a `recipes` folder beside it. Keep that folder when replacing the EXE.
+Download `Relf.exe` from [GitHub Releases](https://github.com/notuxius/refl/releases) when the first Relf release is available. Earlier releases contain `ReleaseShelf.exe`. Place it in a writable folder and double-click it. The executable includes Python. Saving your first item creates a `recipes` folder beside it. Keep that folder when replacing the EXE.
 
 To run from source, use Python 3.13 or newer. Double-click `relf_ui.pyw` or open PowerShell in this folder and run:
 
